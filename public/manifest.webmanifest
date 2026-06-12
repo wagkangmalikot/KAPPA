@@ -1,0 +1,24 @@
+{
+  "name": "KAPPA — Stems & Tabs",
+  "short_name": "KAPPA",
+  "description": "Split any song into stems, play them back, and generate guitar & drum tabs — all offline in your browser.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#e0e5ec",
+  "theme_color": "#e0e5ec",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

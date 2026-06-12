@@ -11,8 +11,6 @@ const GUITAR_STRINGS = [
 ];
 
 function findBestPosition(midiNotes) {
-  // Scan all 5-fret windows (0-4, 1-5, ..., 20-24) and pick the one
-  // that covers the most notes, preferring lower positions on ties.
   let bestPos = 0;
   let bestCount = -1;
   for (let pos = 0; pos <= 20; pos++) {
@@ -29,7 +27,6 @@ function findBestPosition(midiNotes) {
 }
 
 function midiToFret(midi, position) {
-  // Prefer a string/fret inside [position, position+4]; fall back to lowest fret.
   let inPos = null;
   let fallback = null;
   for (const str of GUITAR_STRINGS) {
@@ -44,8 +41,8 @@ function midiToFret(midi, position) {
 }
 
 function renderAsciiTab(notes) {
-  const BIN_SIZE = 0.25;
-  const COLS_PER_LINE = 32;
+  const BIN_SIZE = 0.1;
+  const COLS_PER_LINE = 40;
 
   const position = findBestPosition(notes.map((n) => n.pitchMidi));
 
@@ -54,7 +51,6 @@ function renderAsciiTab(notes) {
 
   const grid = GUITAR_STRINGS.map(() => new Array(totalCols).fill(null));
 
-  // Group notes by time column
   const binMap = new Map();
   for (const note of notes) {
     const col = Math.floor(note.startTimeSeconds / BIN_SIZE);
@@ -62,7 +58,6 @@ function renderAsciiTab(notes) {
     binMap.get(col).push(note);
   }
 
-  // Assign notes to strings — most confident first, no two notes on the same string
   for (const [col, binNotes] of binMap) {
     const sorted = [...binNotes].sort((a, b) => b.amplitude - a.amplitude);
     const usedStrings = new Set();
@@ -108,19 +103,126 @@ function renderAsciiTab(notes) {
   return lines.join('\n');
 }
 
-const instrumentTypes = [
-  { key: 'original', label: 'Original' },
-  { key: 'guitar',   label: 'Guitar/Other' },
-  { key: 'bass',     label: 'Bass' },
-  { key: 'drums',    label: 'Drums' },
-  { key: 'vocals',   label: 'Vocals' },
+// ── Drum detection ──────────────────────────────────────────────
+
+const DRUM_PARTS = [
+  { key: 'BD', lowFreq: 30,   highFreq: 250,  threshFactor: 4.0, minGap: 0.08 },
+  { key: 'SD', lowFreq: 250,  highFreq: 5000, threshFactor: 3.5, minGap: 0.07 },
+  { key: 'HH', lowFreq: 7000, highFreq: null, threshFactor: 3.0, minGap: 0.04 },
 ];
+
+async function filterBand(mono, sampleRate, lowFreq, highFreq) {
+  const ctx = new OfflineAudioContext(1, mono.length, sampleRate);
+  const buf = ctx.createBuffer(1, mono.length, sampleRate);
+  buf.copyToChannel(mono, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  let node = src;
+  if (lowFreq) {
+    const hpf = ctx.createBiquadFilter();
+    hpf.type = 'highpass';
+    hpf.frequency.value = lowFreq;
+    hpf.Q.value = 0.7;
+    node.connect(hpf);
+    node = hpf;
+  }
+  if (highFreq) {
+    const lpf = ctx.createBiquadFilter();
+    lpf.type = 'lowpass';
+    lpf.frequency.value = highFreq;
+    lpf.Q.value = 0.7;
+    node.connect(lpf);
+    node = lpf;
+  }
+  node.connect(ctx.destination);
+  src.start();
+  const out = await ctx.startRendering();
+  return out.getChannelData(0);
+}
+
+function onsetsFromEnergy(data, sampleRate, threshFactor, minGapSec) {
+  const FRAME = 512;
+  const HOP = 256;
+  const minGapFrames = Math.ceil((minGapSec * sampleRate) / HOP);
+
+  const energies = [];
+  for (let i = 0; i + FRAME <= data.length; i += HOP) {
+    let e = 0;
+    for (let j = 0; j < FRAME; j++) e += data[i + j] ** 2;
+    energies.push(Math.sqrt(e / FRAME));
+  }
+
+  // Positive spectral flux — better onset sensitivity than raw energy
+  const flux = energies.map((e, i) => (i > 0 ? Math.max(0, e - energies[i - 1]) : 0));
+
+  const LOOKBACK = 20;
+  const onsets = [];
+  let lastFrame = -minGapFrames;
+
+  for (let i = 2; i < flux.length - 1; i++) {
+    const local = flux.slice(Math.max(0, i - LOOKBACK), i);
+    const mean = local.reduce((s, v) => s + v, 0) / local.length;
+    const std = Math.sqrt(local.reduce((s, v) => s + (v - mean) ** 2, 0) / local.length);
+    const threshold = mean + threshFactor * std;
+    if (
+      flux[i] > threshold &&
+      flux[i] >= flux[i - 1] &&
+      flux[i] >= flux[i + 1] &&
+      i - lastFrame >= minGapFrames
+    ) {
+      onsets.push((i * HOP) / sampleRate);
+      lastFrame = i;
+    }
+  }
+  return onsets;
+}
+
+function renderDrumTab(parts, duration) {
+  const BIN_SIZE = 0.05;
+  const COLS_PER_LINE = 64;
+  const partOrder = ['HH', 'SD', 'BD'];
+  const totalCols = Math.ceil(duration / BIN_SIZE);
+
+  const grids = {};
+  for (const part of partOrder) {
+    grids[part] = new Array(totalCols).fill(false);
+    for (const t of (parts[part] || [])) {
+      const col = Math.floor(t / BIN_SIZE);
+      if (col >= 0 && col < totalCols) grids[part][col] = true;
+    }
+  }
+
+  const lines = [];
+  for (let lineStart = 0; lineStart < totalCols; lineStart += COLS_PER_LINE) {
+    const lineEnd = Math.min(lineStart + COLS_PER_LINE, totalCols);
+    for (const part of partOrder) {
+      let row = `${part}|`;
+      for (let c = lineStart; c < lineEnd; c++) row += grids[part][c] ? 'x' : '-';
+      row += '|';
+      lines.push(row);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+const instrumentTypes = [
+  { key: 'guitar', label: 'Guitar/Other', emoji: '🎸' },
+  { key: 'bass',   label: 'Bass',         emoji: '🎵' },
+  { key: 'drums',  label: 'Drums',        emoji: '🥁' },
+  { key: 'vocals', label: 'Vocals',       emoji: '🎤' },
+];
+
+function formatTime(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
 
 function App() {
   const [audioFile, setAudioFile] = useState(null);
   const [audioName, setAudioName] = useState('');
   const [audioUrl, setAudioUrl] = useState('');
-  const [selectedInstrument, setSelectedInstrument] = useState('original');
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stems, setStems] = useState({ guitar: '', bass: '', drums: '', vocals: '' });
@@ -130,50 +232,142 @@ function App() {
   const [tabProgress, setTabProgress] = useState(0);
   const [tabError, setTabError] = useState('');
   const [guitarFileLabel, setGuitarFileLabel] = useState('');
+  const [guitarDuration, setGuitarDuration] = useState(0);
+  const [tabStartSec, setTabStartSec] = useState(0);
+  const [tabEndSec, setTabEndSec] = useState(0);
+  const [tabIsPlaying, setTabIsPlaying] = useState(false);
+  const [tabDisplayTime, setTabDisplayTime] = useState(0);
+  const [tabDuration, setTabDuration] = useState(0);
+
+  const [activeTabSection, setActiveTabSection] = useState('guitar');
+
+  // Drum tab
+  const [drumTabText, setDrumTabText] = useState('');
+  const [drumTabProcessing, setDrumTabProcessing] = useState(false);
+  const [drumTabProgress, setDrumTabProgress] = useState(0);
+  const [drumTabError, setDrumTabError] = useState('');
+  const [drumFileLabel, setDrumFileLabel] = useState('');
+  const [drumDuration, setDrumDuration] = useState(0);
+  const [drumTabStartSec, setDrumTabStartSec] = useState(0);
+  const [drumTabEndSec, setDrumTabEndSec] = useState(0);
+  const [drumTabIsPlaying, setDrumTabIsPlaying] = useState(false);
+  const [drumTabDisplayTime, setDrumTabDisplayTime] = useState(0);
+  const [drumTabDuration, setDrumTabDuration] = useState(0);
+
+  // Stem player
+  const [activeStemKeys, setActiveStemKeys] = useState(new Set());
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [displayTime, setDisplayTime] = useState(0);
+
+  const tabSliceRef = useRef(null);
+  const tabAudioBufRef = useRef(null);
+  const tabCtxRef = useRef(null);
+  const tabSrcRef = useRef(null);
+  const tabRafRef = useRef(null);
+  const tabScrubberRef = useRef(null);
+  const tabPlayStartCtxRef = useRef(0);
+  const tabPlayOffsetRef = useRef(0);
+  const rangeRef = useRef(null);
+  const draggingHandleRef = useRef(null);
+
+  const drumStemRef = useRef(null);
+  const drumTabSliceRef = useRef(null);
+  const drumTabAudioBufRef = useRef(null);
+  const drumTabCtxRef = useRef(null);
+  const drumTabSrcRef = useRef(null);
+  const drumTabRafRef = useRef(null);
+  const drumTabScrubberRef = useRef(null);
+  const drumTabPlayStartCtxRef = useRef(0);
+  const drumTabPlayOffsetRef = useRef(0);
+  const drumRangeRef = useRef(null);
+  const drumDraggingHandleRef = useRef(null);
+
   const processorRef = useRef(null);
   const previousUrlsRef = useRef([]);
-  const guitarStemRef = useRef(null); // { left: Float32Array, right: Float32Array, sampleRate: number }
+  const guitarStemRef = useRef(null);
   const sampleRateRef = useRef(44100);
 
+  // Stem player refs
+  const stemsDataRef = useRef({});
+  const stemBuffersRef = useRef({});
+  const stemDurationRef = useRef(0);
+  const audioCtxRef = useRef(null);
+  const sourceNodesRef = useRef([]);
+  const playbackStartCtxTimeRef = useRef(0);
+  const playOffsetRef = useRef(0);
+  const rafRef = useRef(null);
+  const scrubberRef = useRef(null);
+  const activeStemKeysRef = useRef(new Set());
+
   useEffect(() => {
-    // Worker will handle ONNX initialization
-    // This effect ensures proper cleanup when component unmounts
     return () => {
-      if (processorRef.current) {
-        processorRef.current.terminate?.();
-      }
+      if (processorRef.current) processorRef.current.terminate?.();
       clearPreviousUrls();
+      stopNodes();
+      audioCtxRef.current?.close();
+      stopTabNodes();
+      tabCtxRef.current?.close();
+      stopDrumTabNodes();
+      drumTabCtxRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (guitarDuration > 0) {
+      setTabStartSec(0);
+      setTabEndSec(guitarDuration);
+    }
+  }, [guitarDuration]);
+
+  useEffect(() => {
+    if (drumDuration > 0) {
+      setDrumTabStartSec(0);
+      setDrumTabEndSec(drumDuration);
+    }
+  }, [drumDuration]);
 
   const clearPreviousUrls = () => {
     previousUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     previousUrlsRef.current = [];
   };
 
+  const stopNodes = () => {
+    sourceNodesRef.current.forEach((n) => { try { n.stop(); } catch {} });
+    sourceNodesRef.current = [];
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+  };
+
+  const resetPlayerState = () => {
+    stopNodes();
+    setIsPlaying(false);
+    setDisplayTime(0);
+    playOffsetRef.current = 0;
+    if (scrubberRef.current) scrubberRef.current.value = '0';
+  };
+
   const handleMainFile = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
     clearPreviousUrls();
+    resetPlayerState();
     const url = URL.createObjectURL(file);
     setAudioFile(file);
     setAudioName(file.name);
     setAudioUrl(url);
     previousUrlsRef.current.push(url);
-    setSelectedInstrument('original');
     setIsSeparated(false);
     setStems({ guitar: '', bass: '', drums: '', vocals: '' });
     guitarStemRef.current = null;
+    stemsDataRef.current = {};
+    stemBuffersRef.current = {};
+    stemDurationRef.current = 0;
+    setActiveStemKeys(new Set());
+    activeStemKeysRef.current = new Set();
     setProgress(0);
   };
 
-  const setInstrument = (instrumentKey) => {
-    setSelectedInstrument(instrumentKey);
-  };
-
   const initializeWorker = () => {
-    // Always create a fresh worker for each operation
-    // This prevents issues with previous operations hanging
     const worker = new Worker(separationWorkerUrl, { type: 'module' });
     return worker;
   };
@@ -191,15 +385,6 @@ function App() {
     const writeString = (view2, offset, string) => {
       for (let i = 0; i < string.length; i += 1) {
         view2.setUint8(offset + i, string.charCodeAt(i));
-      }
-    };
-
-    const floatTo16BitPCM = (output, offset, input) => {
-      for (let i = 0; i < input.length; i += 1) {
-        let sample = Math.max(-1, Math.min(1, input[i]));
-        sample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        output.setInt16(offset, sample, true);
-        offset += 2;
       }
     };
 
@@ -243,7 +428,6 @@ function App() {
       return '';
     }
     try {
-      // Ensure arrays are Float32Array for WAV creation
       const leftArray = stem.left instanceof Float32Array ? stem.left : new Float32Array(stem.left);
       const rightArray = stem.right instanceof Float32Array ? stem.right : new Float32Array(stem.right);
 
@@ -262,6 +446,7 @@ function App() {
     setProcessing(true);
     setProgress(0);
     setIsSeparated(false);
+    resetPlayerState();
 
     try {
       console.log('Starting separation...');
@@ -286,11 +471,10 @@ function App() {
       console.log('Starting processor.separate()...');
       setProgress(0.5);
 
-      // Use Web Worker for separation to keep UI responsive
       const result = await new Promise((resolve, reject) => {
         const worker = initializeWorker();
 
-        const SEGMENT_TIMEOUT = 600000; // 10 min per segment (WASM is slow)
+        const SEGMENT_TIMEOUT = 600000;
         let timeoutId = setTimeout(() => {
           reject(new Error('Separation timeout: no progress for 10 minutes'));
         }, SEGMENT_TIMEOUT);
@@ -303,7 +487,7 @@ function App() {
         };
 
         const handleMessage = (event) => {
-          const { type, result, error, message } = event.data;
+          const { type, result, error } = event.data;
 
           if (type === 'result') {
             clearTimeout(timeoutId);
@@ -317,7 +501,7 @@ function App() {
             reject(new Error(error));
           } else if (type === 'segmentProgress') {
             resetTimeout();
-            const { progress: segProg, currentSegment, totalSegments } = event.data;
+            const { progress: segProg } = event.data;
             setProgress(0.5 + segProg * 0.4);
           } else if (type === 'status') {
             resetTimeout();
@@ -338,20 +522,13 @@ function App() {
         worker.addEventListener('message', handleMessage);
         worker.addEventListener('error', handleError);
 
-        // Use Transferable objects to avoid copying large audio buffers
         const leftArray = new Float32Array(left);
         const rightArray = new Float32Array(right);
 
         console.log(`Sending separate message to worker (left: ${leftArray.length}, right: ${rightArray.length})...`);
         worker.postMessage(
-          {
-            type: 'separate',
-            data: {
-              left: leftArray,
-              right: rightArray,
-            },
-          },
-          [leftArray.buffer, rightArray.buffer] // Transfer ownership of the buffers
+          { type: 'separate', data: { left: leftArray, right: rightArray } },
+          [leftArray.buffer, rightArray.buffer]
         );
         console.log('Separate message sent with transferable buffers');
       });
@@ -368,16 +545,42 @@ function App() {
           stemUrls[name] = createStemUrl(result[name], sampleRate);
         }
 
+        // Store raw audio data for all stems for Web Audio playback
+        stemsDataRef.current = {};
+        stemBuffersRef.current = {};
+        for (const name of ['guitar', 'bass', 'drums', 'vocals']) {
+          stemsDataRef.current[name] = {
+            left: result[name].left instanceof Float32Array ? result[name].left : new Float32Array(result[name].left),
+            right: result[name].right instanceof Float32Array ? result[name].right : new Float32Array(result[name].right),
+            sampleRate,
+          };
+        }
+        stemDurationRef.current = stemsDataRef.current.guitar.left.length / sampleRate;
+
         guitarStemRef.current = {
-          left: result.guitar.left,
-          right: result.guitar.right,
+          left: stemsDataRef.current.guitar.left,
+          right: stemsDataRef.current.guitar.right,
           sampleRate,
         };
         setGuitarFileLabel('');
+        setGuitarDuration(stemsDataRef.current.guitar.left.length / sampleRate);
+
+        drumStemRef.current = {
+          left: stemsDataRef.current.drums.left,
+          right: stemsDataRef.current.drums.right,
+          sampleRate,
+        };
+        setDrumFileLabel('');
+        setDrumDuration(stemsDataRef.current.drums.left.length / sampleRate);
+
+        const allKeys = new Set(['guitar', 'bass', 'drums', 'vocals']);
+        setActiveStemKeys(allKeys);
+        activeStemKeysRef.current = new Set(allKeys);
 
         setStems(stemUrls);
-        setSelectedInstrument('original');
         setIsSeparated(true);
+        setDisplayTime(0);
+        playOffsetRef.current = 0;
         setProgress(1);
         console.log('UI updated, separation complete');
       } catch (wavError) {
@@ -393,11 +596,411 @@ function App() {
     }
   };
 
+  const toggleStem = (key) => {
+    if (isPlaying) {
+      stopNodes();
+      setIsPlaying(false);
+    }
+    setActiveStemKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      activeStemKeysRef.current = next;
+      return next;
+    });
+  };
+
+  const getOrCreateBuffer = (key, ctx) => {
+    if (stemBuffersRef.current[key]) return stemBuffersRef.current[key];
+    const d = stemsDataRef.current[key];
+    if (!d) return null;
+    const buf = ctx.createBuffer(2, d.left.length, d.sampleRate);
+    buf.copyToChannel(d.left, 0);
+    buf.copyToChannel(d.right, 1);
+    stemBuffersRef.current[key] = buf;
+    return buf;
+  };
+
+  const startPlayback = (offset = playOffsetRef.current) => {
+    stopNodes();
+
+    const activeKeys = [...activeStemKeysRef.current];
+    if (activeKeys.length === 0) return;
+
+    if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+      audioCtxRef.current = new AudioContext();
+      stemBuffersRef.current = {};
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const nodes = [];
+    for (const key of activeKeys) {
+      const buf = getOrCreateBuffer(key, ctx);
+      if (!buf) continue;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      nodes.push(src);
+    }
+
+    if (nodes.length === 0) return;
+
+    const startAt = ctx.currentTime + 0.05;
+    nodes.forEach((n) => n.start(startAt, offset));
+    sourceNodesRef.current = nodes;
+    // playbackStartCtxTimeRef tracks the ctx time that corresponds to track position 0
+    playbackStartCtxTimeRef.current = startAt - offset;
+
+    const duration = stemDurationRef.current;
+    const tick = () => {
+      const t = Math.min(ctx.currentTime - playbackStartCtxTimeRef.current, duration);
+      setDisplayTime(t);
+      if (scrubberRef.current) scrubberRef.current.value = String(t);
+      if (t < duration) {
+        rafRef.current = requestAnimationFrame(tick);
+      } else {
+        stopNodes();
+        setIsPlaying(false);
+        setDisplayTime(0);
+        playOffsetRef.current = 0;
+        if (scrubberRef.current) scrubberRef.current.value = '0';
+      }
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    setIsPlaying(true);
+  };
+
+  const pausePlayback = () => {
+    const ctx = audioCtxRef.current;
+    let offset = playOffsetRef.current;
+    if (ctx) {
+      offset = Math.min(ctx.currentTime - playbackStartCtxTimeRef.current, stemDurationRef.current);
+      playOffsetRef.current = offset;
+    }
+    stopNodes();
+    setIsPlaying(false);
+    setDisplayTime(offset);
+    if (scrubberRef.current) scrubberRef.current.value = String(offset);
+  };
+
+  const handleStop = () => {
+    stopNodes();
+    setIsPlaying(false);
+    setDisplayTime(0);
+    playOffsetRef.current = 0;
+    if (scrubberRef.current) scrubberRef.current.value = '0';
+  };
+
+  const handleScrub = (e) => {
+    const newTime = parseFloat(e.target.value);
+    playOffsetRef.current = newTime;
+    setDisplayTime(newTime);
+    if (isPlaying) startPlayback(newTime);
+  };
+
+  const stopTabNodes = () => {
+    try { tabSrcRef.current?.stop(); } catch {}
+    tabSrcRef.current = null;
+    if (tabRafRef.current) cancelAnimationFrame(tabRafRef.current);
+    tabRafRef.current = null;
+  };
+
+  const startTabPlayback = (offset = tabPlayOffsetRef.current) => {
+    stopTabNodes();
+    const slice = tabSliceRef.current;
+    if (!slice) return;
+
+    if (!tabCtxRef.current || tabCtxRef.current.state === 'closed') {
+      tabCtxRef.current = new AudioContext();
+      tabAudioBufRef.current = null;
+    }
+    const ctx = tabCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    if (!tabAudioBufRef.current) {
+      const buf = ctx.createBuffer(1, slice.mono.length, slice.sampleRate);
+      buf.copyToChannel(slice.mono, 0);
+      tabAudioBufRef.current = buf;
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = tabAudioBufRef.current;
+    src.connect(ctx.destination);
+    const startAt = ctx.currentTime + 0.05;
+    src.start(startAt, offset);
+    tabSrcRef.current = src;
+    tabPlayStartCtxRef.current = startAt - offset;
+
+    const duration = slice.duration;
+    const tick = () => {
+      const t = Math.min(ctx.currentTime - tabPlayStartCtxRef.current, duration);
+      setTabDisplayTime(t);
+      if (tabScrubberRef.current) tabScrubberRef.current.value = String(t);
+      if (t < duration) {
+        tabRafRef.current = requestAnimationFrame(tick);
+      } else {
+        stopTabNodes();
+        setTabIsPlaying(false);
+        setTabDisplayTime(0);
+        tabPlayOffsetRef.current = 0;
+        if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
+      }
+    };
+    tabRafRef.current = requestAnimationFrame(tick);
+    setTabIsPlaying(true);
+  };
+
+  const pauseTabPlayback = () => {
+    const ctx = tabCtxRef.current;
+    let offset = tabPlayOffsetRef.current;
+    if (ctx) {
+      offset = Math.min(ctx.currentTime - tabPlayStartCtxRef.current, tabSliceRef.current?.duration || 0);
+      tabPlayOffsetRef.current = offset;
+    }
+    stopTabNodes();
+    setTabIsPlaying(false);
+    setTabDisplayTime(offset);
+    if (tabScrubberRef.current) tabScrubberRef.current.value = String(offset);
+  };
+
+  const handleTabStop = () => {
+    stopTabNodes();
+    setTabIsPlaying(false);
+    setTabDisplayTime(0);
+    tabPlayOffsetRef.current = 0;
+    if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
+  };
+
+  const handleTabScrub = (e) => {
+    const newTime = parseFloat(e.target.value);
+    tabPlayOffsetRef.current = newTime;
+    setTabDisplayTime(newTime);
+    if (tabIsPlaying) startTabPlayback(newTime);
+  };
+
+  // ── Drum tab player ─────────────────────────────────────────────
+
+  const stopDrumTabNodes = () => {
+    try { drumTabSrcRef.current?.stop(); } catch {}
+    drumTabSrcRef.current = null;
+    if (drumTabRafRef.current) cancelAnimationFrame(drumTabRafRef.current);
+    drumTabRafRef.current = null;
+  };
+
+  const startDrumTabPlayback = (offset = drumTabPlayOffsetRef.current) => {
+    stopDrumTabNodes();
+    const slice = drumTabSliceRef.current;
+    if (!slice) return;
+    if (!drumTabCtxRef.current || drumTabCtxRef.current.state === 'closed') {
+      drumTabCtxRef.current = new AudioContext();
+      drumTabAudioBufRef.current = null;
+    }
+    const ctx = drumTabCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+    if (!drumTabAudioBufRef.current) {
+      const buf = ctx.createBuffer(1, slice.mono.length, slice.sampleRate);
+      buf.copyToChannel(slice.mono, 0);
+      drumTabAudioBufRef.current = buf;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = drumTabAudioBufRef.current;
+    src.connect(ctx.destination);
+    const startAt = ctx.currentTime + 0.05;
+    src.start(startAt, offset);
+    drumTabSrcRef.current = src;
+    drumTabPlayStartCtxRef.current = startAt - offset;
+    const duration = slice.duration;
+    const tick = () => {
+      const t = Math.min(ctx.currentTime - drumTabPlayStartCtxRef.current, duration);
+      setDrumTabDisplayTime(t);
+      if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = String(t);
+      if (t < duration) {
+        drumTabRafRef.current = requestAnimationFrame(tick);
+      } else {
+        stopDrumTabNodes();
+        setDrumTabIsPlaying(false);
+        setDrumTabDisplayTime(0);
+        drumTabPlayOffsetRef.current = 0;
+        if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
+      }
+    };
+    drumTabRafRef.current = requestAnimationFrame(tick);
+    setDrumTabIsPlaying(true);
+  };
+
+  const pauseDrumTabPlayback = () => {
+    const ctx = drumTabCtxRef.current;
+    let offset = drumTabPlayOffsetRef.current;
+    if (ctx) {
+      offset = Math.min(ctx.currentTime - drumTabPlayStartCtxRef.current, drumTabSliceRef.current?.duration || 0);
+      drumTabPlayOffsetRef.current = offset;
+    }
+    stopDrumTabNodes();
+    setDrumTabIsPlaying(false);
+    setDrumTabDisplayTime(offset);
+    if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = String(offset);
+  };
+
+  const handleDrumTabStop = () => {
+    stopDrumTabNodes();
+    setDrumTabIsPlaying(false);
+    setDrumTabDisplayTime(0);
+    drumTabPlayOffsetRef.current = 0;
+    if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
+  };
+
+  const handleDrumTabScrub = (e) => {
+    const t = parseFloat(e.target.value);
+    drumTabPlayOffsetRef.current = t;
+    setDrumTabDisplayTime(t);
+    if (drumTabIsPlaying) startDrumTabPlayback(t);
+  };
+
+  // ── Drum range selector ──────────────────────────────────────────
+
+  const handleDrumRangePointerDown = (e) => {
+    const handle = e.target.closest('[data-handle]');
+    if (!handle) return;
+    drumDraggingHandleRef.current = handle.dataset.handle;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handleDrumRangePointerMove = (e) => {
+    if (!drumDraggingHandleRef.current || !drumRangeRef.current) return;
+    const rect = drumRangeRef.current.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const time = pct * drumDuration;
+    if (drumDraggingHandleRef.current === 'start') {
+      setDrumTabStartSec(Math.min(time, drumTabEndSec - 0.5));
+    } else {
+      setDrumTabEndSec(Math.max(time, drumTabStartSec + 0.5));
+    }
+  };
+
+  const handleDrumRangePointerUp = () => { drumDraggingHandleRef.current = null; };
+
+  // ── Drum file upload ─────────────────────────────────────────────
+
+  const handleDrumFile = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setDrumTabText('');
+    setDrumTabError('');
+    setDrumTabDuration(0);
+    drumTabSliceRef.current = null;
+    drumTabAudioBufRef.current = null;
+    stopDrumTabNodes();
+    setDrumTabIsPlaying(false);
+    setDrumTabDisplayTime(0);
+    drumTabPlayOffsetRef.current = 0;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const audioCtx = new AudioContext();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      const left = audioBuffer.numberOfChannels > 0 ? audioBuffer.getChannelData(0) : new Float32Array(audioBuffer.length);
+      const right = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : left;
+      drumStemRef.current = {
+        left: new Float32Array(left),
+        right: new Float32Array(right),
+        sampleRate: audioBuffer.sampleRate,
+      };
+      setDrumFileLabel(file.name);
+      setDrumDuration(audioBuffer.duration);
+    } catch (err) {
+      setDrumTabError(`Could not decode audio file: ${err.message}`);
+    }
+  };
+
+  // ── Drum tab detection ───────────────────────────────────────────
+
+  const detectDrumTab = async () => {
+    const stemData = drumStemRef.current;
+    if (!stemData) return;
+    setDrumTabProcessing(true);
+    setDrumTabProgress(0);
+    setDrumTabError('');
+    setDrumTabText('');
+    try {
+      const { left, right, sampleRate } = stemData;
+      const fullDuration = left.length / sampleRate;
+      const startSec = Math.max(0, drumTabStartSec);
+      const endSec = Math.min(fullDuration, drumTabEndSec > 0 ? drumTabEndSec : fullDuration);
+      const startSample = Math.floor(startSec * sampleRate);
+      const endSample = Math.floor(endSec * sampleRate);
+
+      const mono = new Float32Array(endSample - startSample);
+      for (let i = startSample; i < endSample; i++) {
+        mono[i - startSample] = (left[i] + right[i]) / 2;
+      }
+
+      stopDrumTabNodes();
+      drumTabSliceRef.current = { mono: new Float32Array(mono), sampleRate, duration: mono.length / sampleRate };
+      drumTabAudioBufRef.current = null;
+      setDrumTabDuration(mono.length / sampleRate);
+      setDrumTabIsPlaying(false);
+      setDrumTabDisplayTime(0);
+      drumTabPlayOffsetRef.current = 0;
+      if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
+
+      const parts = {};
+      for (let pi = 0; pi < DRUM_PARTS.length; pi++) {
+        const { key, lowFreq, highFreq, threshFactor, minGap } = DRUM_PARTS[pi];
+        setDrumTabProgress((pi + 0.5) / DRUM_PARTS.length);
+        const filtered = await filterBand(mono, sampleRate, lowFreq, highFreq);
+        parts[key] = onsetsFromEnergy(filtered, sampleRate, threshFactor, minGap);
+      }
+      setDrumTabProgress(1);
+
+      const allEmpty = Object.values(parts).every((v) => v.length === 0);
+      if (allEmpty) {
+        setDrumTabError('No drum hits detected. Try a shorter or louder segment.');
+      } else {
+        setDrumTabText(renderDrumTab(parts, mono.length / sampleRate));
+      }
+    } catch (err) {
+      console.error('Drum tab error:', err);
+      setDrumTabError(`Detection failed: ${err.message}`);
+    } finally {
+      setDrumTabProcessing(false);
+    }
+  };
+
+  const handleRangePointerDown = (e) => {
+    const handle = e.target.closest('[data-handle]');
+    if (!handle) return;
+    draggingHandleRef.current = handle.dataset.handle;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handleRangePointerMove = (e) => {
+    if (!draggingHandleRef.current || !rangeRef.current) return;
+    const rect = rangeRef.current.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const time = pct * guitarDuration;
+    if (draggingHandleRef.current === 'start') {
+      setTabStartSec(Math.min(time, tabEndSec - 0.5));
+    } else {
+      setTabEndSec(Math.max(time, tabStartSec + 0.5));
+    }
+  };
+
+  const handleRangePointerUp = () => {
+    draggingHandleRef.current = null;
+  };
+
   const handleGuitarFile = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
     setTabText('');
     setTabError('');
+    setTabDuration(0);
+    tabSliceRef.current = null;
+    tabAudioBufRef.current = null;
+    stopTabNodes();
+    setTabIsPlaying(false);
+    setTabDisplayTime(0);
+    tabPlayOffsetRef.current = 0;
     try {
       const arrayBuffer = await file.arrayBuffer();
       const audioContext = new AudioContext();
@@ -414,6 +1017,7 @@ function App() {
         sampleRate: audioBuffer.sampleRate,
       };
       setGuitarFileLabel(file.name);
+      setGuitarDuration(audioBuffer.duration);
     } catch (err) {
       setTabError(`Could not decode audio file: ${err.message}`);
     }
@@ -432,8 +1036,26 @@ function App() {
       const { BasicPitch, outputToNotesPoly, noteFramesToTime } = await import('@spotify/basic-pitch');
 
       const { left, right, sampleRate } = stemData;
-      const mono = new Float32Array(left.length);
-      for (let i = 0; i < left.length; i++) mono[i] = (left[i] + right[i]) / 2;
+      const fullDuration = left.length / sampleRate;
+      const startSec = Math.max(0, tabStartSec);
+      const endSec = Math.min(fullDuration, tabEndSec > 0 ? tabEndSec : fullDuration);
+      const startSample = Math.floor(startSec * sampleRate);
+      const endSample = Math.floor(endSec * sampleRate);
+
+      const mono = new Float32Array(endSample - startSample);
+      for (let i = startSample; i < endSample; i++) {
+        mono[i - startSample] = (left[i] + right[i]) / 2;
+      }
+
+      // Store slice for the tab player
+      stopTabNodes();
+      tabSliceRef.current = { mono: new Float32Array(mono), sampleRate, duration: mono.length / sampleRate };
+      tabAudioBufRef.current = null;
+      setTabDuration(mono.length / sampleRate);
+      setTabIsPlaying(false);
+      setTabDisplayTime(0);
+      tabPlayOffsetRef.current = 0;
+      if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
 
       const audioCtx = new AudioContext();
       const inputBuffer = audioCtx.createBuffer(1, mono.length, sampleRate);
@@ -465,18 +1087,18 @@ function App() {
         (progress) => setTabProgress(progress),
       );
 
-      const MIN_NOTE_DURATION = 0.2;
+      const MIN_NOTE_DURATION = 0.1;
       const notes = outputToNotesPoly(
         frames, onsets,
-        0.65,  // onsetThreshold — higher = fewer ghost notes
-        0.5,   // frameThreshold
+        0.5,   // onset threshold (was 0.65)
+        0.3,   // frame threshold (was 0.5)
         MIN_NOTE_DURATION,
-        true,  // inferOnsets
-        1320,  // maxFrequency — E6, top of guitar range
-        80,    // minFrequency — E2, open low E string
+        true,
+        1320,
+        80,
       );
       const notesTimed = noteFramesToTime(notes);
-      const filtered = notesTimed.filter((n) => n.amplitude >= 0.6);
+      const filtered = notesTimed.filter((n) => n.amplitude >= 0.35);
 
       if (filtered.length === 0) {
         setTabError('No guitar notes detected above confidence threshold.');
@@ -491,104 +1113,212 @@ function App() {
     }
   };
 
-  const selectedInstrumentLabel = instrumentTypes.find((instrument) => instrument.key === selectedInstrument)?.label || 'Original';
-  const currentAudioSrc = selectedInstrument === 'original' ? audioUrl : stems[selectedInstrument];
+  const activeStemLabels = [...activeStemKeys]
+    .map((k) => instrumentTypes.find((i) => i.key === k)?.label)
+    .filter(Boolean)
+    .join(' + ');
 
   return (
     <div className="app-shell">
       <header>
-        <h1>Local Stem Separator</h1>
-        <p>Load a local audio file and separate it into stems directly in the browser using Demucs.</p>
+        <h1>KAPPA</h1>
+        <p>Split any song into stems, play them back, and generate guitar & drum tabs — all offline in your browser.</p>
       </header>
 
       <section className="card">
-        <h2>Main audio source</h2>
-        <label>
-          Local audio file:
-          <input type="file" accept="audio/*" onChange={handleMainFile} />
-        </label>
-        {audioName && (
-          <div className="audio-player">
-            <strong>Loaded file:</strong> {audioName}
+        <h2>Audio source</h2>
+        {!audioName ? (
+          <label className="upload-zone">
+            <div className="upload-icon">🎵</div>
+            <div className="upload-text">Tap to load audio</div>
+            <div className="upload-hint">MP3, WAV, FLAC…</div>
+            <input type="file" accept="audio/*" onChange={handleMainFile} />
+          </label>
+        ) : (
+          <div className="file-loaded">
+            <div className="file-name">📄 {audioName}</div>
             <audio controls src={audioUrl} />
           </div>
         )}
-        <button type="button" onClick={handleSeparate} disabled={!audioFile || processing}>
-          {processing ? 'Separating...' : 'Separate Stems'}
-        </button>
-        <div className="progress-row">
-          <div className="progress-bar-bg">
-            <div className={`progress-bar-fill${processing ? ' active' : ''}`} style={{ width: `${Math.round(progress * 100)}%` }} />
+
+        {audioName && (
+          <button type="button" onClick={handleSeparate} disabled={!audioFile || processing}>
+            {processing ? 'Separating…' : 'Separate Stems'}
+          </button>
+        )}
+
+        {(processing || isSeparated) && (
+          <div className="progress-row">
+            <div className="progress-bar-bg">
+              <div className={`progress-bar-fill${processing ? ' active' : ''}`} style={{ width: `${Math.round(progress * 100)}%` }} />
+            </div>
+            <span>{Math.round(progress * 100)}%</span>
           </div>
-          <span>{Math.round(progress * 100)}%</span>
-        </div>
-        {processing && <p className="hint">First run downloads a large model and then processes the audio.</p>}
+        )}
       </section>
 
-      <section className="card">
-        <h2>Instrument selection</h2>
-        <p>Choose the stem you want to hear from the separated output.</p>
-        <div className="instrument-buttons">
-          {instrumentTypes.map((instrument) => (
-            <button
-              key={instrument.key}
-              type="button"
-              className={selectedInstrument === instrument.key ? 'active' : ''}
-              onClick={() => setInstrument(instrument.key)}
-            >
-              {instrument.label}
-            </button>
+      {processing && (
+        <section className="card">
+          <div className="waveform-animation">
+            {Array.from({ length: 14 }, (_, i) => (
+              <span key={i} style={{ animationDelay: `${((i * 0.09) % 0.45).toFixed(2)}s` }} />
+            ))}
+          </div>
+          <p className="processing-status">Separating stems…</p>
+          {instrumentTypes.map(({ key, label, emoji }) => (
+            <div key={key} className="skeleton-card">
+              <div className="skeleton-icon" />
+              <div className="skeleton-lines">
+                <div className="skeleton-line" />
+                <div className="skeleton-line short" />
+              </div>
+            </div>
           ))}
-        </div>
-        <p className="hint">Selected: {selectedInstrumentLabel}</p>
-      </section>
-
-      <section className="card">
-        <h2>Audio player</h2>
-        {selectedInstrument !== 'original' && !stems[selectedInstrument] && (
-          <p className="hint">No stem available yet. Separate the local file first.</p>
-        )}
-        {currentAudioSrc ? (
-          <div className="audio-player">
-            <strong>Playing:</strong> {selectedInstrument === 'original' ? audioName : `${selectedInstrumentLabel} stem`}
-            <audio controls src={currentAudioSrc} />
-          </div>
-        ) : (
-          <p className="hint">Choose a local file and click "Separate Stems" to get individual stems.</p>
-        )}
-      </section>
+          <p className="hint" style={{ textAlign: 'center', marginTop: 8 }}>First run downloads ~172 MB model.</p>
+        </section>
+      )}
 
       {isSeparated && (
         <section className="card">
-          <h2>Separated stems</h2>
-          <p>These stems were generated from your selected local file.</p>
-          {instrumentTypes.filter((instrument) => instrument.key !== 'original').map((instrument) => (
-            <div key={instrument.key} className="stem-preview">
-              <strong>{instrument.label}</strong>
-              {stems[instrument.key] ? (
-                <audio controls src={stems[instrument.key]} />
-              ) : (
-                <p className="hint">Not available yet.</p>
-              )}
-            </div>
-          ))}
+          <h2>Stem Player</h2>
+          <p>Toggle stems to include in playback, then press Play. Download individual stems below each chip.</p>
+
+          <div className="stem-chips">
+            {instrumentTypes.map(({ key, label, emoji }) => (
+              <div key={key} className="stem-chip-item">
+                <button
+                  type="button"
+                  className={`stem-chip${activeStemKeys.has(key) ? ' active' : ''}`}
+                  onClick={() => toggleStem(key)}
+                >
+                  <span className="stem-chip-label">
+                    <span className="stem-chip-emoji">{emoji}</span>
+                    {label}
+                  </span>
+                  <span className="stem-toggle-track">
+                    <span className="stem-toggle-dot" />
+                  </span>
+                </button>
+                <a
+                  href={stems[key]}
+                  download={`${audioName.replace(/\.[^.]+$/, '')}-${key}.wav`}
+                  className="stem-download"
+                  title={`Download ${label}`}
+                >
+                  ⬇
+                </a>
+              </div>
+            ))}
+          </div>
+
+          <div className="stem-scrubber-row">
+            <span className="stem-time">{formatTime(displayTime)}</span>
+            <input
+              ref={scrubberRef}
+              type="range"
+              className="stem-scrubber"
+              min="0"
+              max={stemDurationRef.current || 1}
+              step="0.1"
+              defaultValue="0"
+              onChange={handleScrub}
+            />
+            <span className="stem-time stem-time-right">{formatTime(stemDurationRef.current)}</span>
+          </div>
+
+          <div className="stem-playback-controls">
+            {isPlaying ? (
+              <button type="button" onClick={pausePlayback}>⏸ Pause</button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => startPlayback()}
+                disabled={activeStemKeys.size === 0}
+              >
+                ▶ Play
+              </button>
+            )}
+            <button type="button" className="btn-stop" onClick={handleStop}>⏹ Stop</button>
+            {activeStemKeys.size > 0 ? (
+              <span className="hint">{activeStemLabels}</span>
+            ) : (
+              <span className="hint">Select at least one stem to play.</span>
+            )}
+          </div>
         </section>
       )}
 
       <section className="card">
-        <h2>Guitar Tab</h2>
-        <p>Detect notes and generate an ASCII tab from a guitar stem.</p>
+        <div className="tab-nav">
+          <button
+            type="button"
+            className={`tab-nav-btn${activeTabSection === 'guitar' ? ' active' : ''}`}
+            onClick={() => setActiveTabSection('guitar')}
+          >
+            🎸 Guitar Tab
+          </button>
+          <button
+            type="button"
+            className={`tab-nav-btn${activeTabSection === 'drums' ? ' active' : ''}`}
+            onClick={() => setActiveTabSection('drums')}
+          >
+            🥁 Drum Tab
+          </button>
+        </div>
 
-        <label>
-          Upload a pre-separated guitar file:
+        {activeTabSection === 'guitar' && <>
+        <p style={{ marginBottom: 14 }}>Detect notes and generate an ASCII tab from a guitar stem.</p>
+
+        <p style={{ marginBottom: 10 }}>Upload a pre-separated guitar file</p>
+        <label className="guitar-zone">
+          <div className="guitar-zone-icon">🎸</div>
+          {guitarFileLabel ? (
+            <div className="guitar-zone-filename">{guitarFileLabel}</div>
+          ) : (
+            <>
+              <div className="guitar-zone-text">Tap to choose</div>
+              <div className="guitar-zone-hint">MP3 · WAV · FLAC</div>
+            </>
+          )}
           <input type="file" accept="audio/*" onChange={handleGuitarFile} />
         </label>
 
-        {guitarFileLabel && (
-          <p className="hint">Source: {guitarFileLabel}</p>
-        )}
         {!guitarFileLabel && guitarStemRef.current && (
-          <p className="hint">Source: Guitar/Other stem from separation</p>
+          <p className="hint">Using guitar stem from separation</p>
+        )}
+
+        {guitarDuration > 0 && (
+          <div
+            className="range-selector"
+            ref={rangeRef}
+            onPointerDown={handleRangePointerDown}
+            onPointerMove={handleRangePointerMove}
+            onPointerUp={handleRangePointerUp}
+          >
+            <div className="range-track">
+              <div
+                className="range-fill"
+                style={{
+                  left: `${(tabStartSec / guitarDuration) * 100}%`,
+                  width: `${((tabEndSec - tabStartSec) / guitarDuration) * 100}%`,
+                }}
+              />
+            </div>
+            <div
+              className="range-handle"
+              data-handle="start"
+              style={{ left: `${(tabStartSec / guitarDuration) * 100}%` }}
+            />
+            <div
+              className="range-handle"
+              data-handle="end"
+              style={{ left: `${(tabEndSec / guitarDuration) * 100}%` }}
+            />
+            <div className="range-times">
+              <span>{formatTime(tabStartSec)}</span>
+              <span>{formatTime(tabEndSec)}</span>
+            </div>
+          </div>
         )}
 
         <button
@@ -611,7 +1341,35 @@ function App() {
           </div>
         )}
 
-        {tabError && <p className="hint" style={{ color: '#ef4444' }}>{tabError}</p>}
+        {tabError && <p className="hint" style={{ color: '#e53e3e' }}>{tabError}</p>}
+
+        {tabDuration > 0 && (
+          <div className="tab-player">
+            <div className="tab-player-title">Guitar segment</div>
+            <div className="stem-scrubber-row">
+              <span className="stem-time">{formatTime(tabDisplayTime)}</span>
+              <input
+                ref={tabScrubberRef}
+                type="range"
+                className="stem-scrubber"
+                min="0"
+                max={tabDuration || 1}
+                step="0.1"
+                defaultValue="0"
+                onChange={handleTabScrub}
+              />
+              <span className="stem-time stem-time-right">{formatTime(tabDuration)}</span>
+            </div>
+            <div className="stem-playback-controls">
+              {tabIsPlaying ? (
+                <button type="button" onClick={pauseTabPlayback}>⏸</button>
+              ) : (
+                <button type="button" onClick={() => startTabPlayback()}>▶</button>
+              )}
+              <button type="button" className="btn-stop" onClick={handleTabStop}>⏹</button>
+            </div>
+          </div>
+        )}
 
         {tabText && (
           <div className="tab-display">
@@ -625,6 +1383,115 @@ function App() {
             <pre className="tab-pre">{tabText}</pre>
           </div>
         )}
+        </>}
+
+        {activeTabSection === 'drums' && <>
+        <p style={{ marginBottom: 14 }}>Detect bass drum, snare, and hi-hat hits from a drum stem.</p>
+
+        <p style={{ marginBottom: 10 }}>Upload a pre-separated drum file</p>
+        <label className="guitar-zone">
+          <div className="guitar-zone-icon">🥁</div>
+          {drumFileLabel ? (
+            <div className="guitar-zone-filename">{drumFileLabel}</div>
+          ) : (
+            <>
+              <div className="guitar-zone-text">Tap to choose</div>
+              <div className="guitar-zone-hint">MP3 · WAV · FLAC</div>
+            </>
+          )}
+          <input type="file" accept="audio/*" onChange={handleDrumFile} />
+        </label>
+
+        {!drumFileLabel && drumStemRef.current && (
+          <p className="hint">Using drum stem from separation</p>
+        )}
+
+        {drumDuration > 0 && (
+          <div
+            className="range-selector"
+            ref={drumRangeRef}
+            onPointerDown={handleDrumRangePointerDown}
+            onPointerMove={handleDrumRangePointerMove}
+            onPointerUp={handleDrumRangePointerUp}
+          >
+            <div className="range-track">
+              <div
+                className="range-fill"
+                style={{
+                  left: `${(drumTabStartSec / drumDuration) * 100}%`,
+                  width: `${((drumTabEndSec - drumTabStartSec) / drumDuration) * 100}%`,
+                }}
+              />
+            </div>
+            <div className="range-handle" data-handle="start" style={{ left: `${(drumTabStartSec / drumDuration) * 100}%` }} />
+            <div className="range-handle" data-handle="end" style={{ left: `${(drumTabEndSec / drumDuration) * 100}%` }} />
+            <div className="range-times">
+              <span>{formatTime(drumTabStartSec)}</span>
+              <span>{formatTime(drumTabEndSec)}</span>
+            </div>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={detectDrumTab}
+          disabled={drumTabProcessing || !drumStemRef.current}
+        >
+          {drumTabProcessing ? 'Detecting…' : 'Detect Drum Tab'}
+        </button>
+
+        {drumTabProcessing && (
+          <div className="progress-row">
+            <div className="progress-bar-bg">
+              <div className="progress-bar-fill active" style={{ width: `${Math.round(drumTabProgress * 100)}%` }} />
+            </div>
+            <span>{Math.round(drumTabProgress * 100)}%</span>
+          </div>
+        )}
+
+        {drumTabError && <p className="hint" style={{ color: '#e53e3e' }}>{drumTabError}</p>}
+
+        {drumTabDuration > 0 && (
+          <div className="tab-player">
+            <div className="tab-player-title">Drum segment</div>
+            <div className="stem-scrubber-row">
+              <span className="stem-time">{formatTime(drumTabDisplayTime)}</span>
+              <input
+                ref={drumTabScrubberRef}
+                type="range"
+                className="stem-scrubber"
+                min="0"
+                max={drumTabDuration || 1}
+                step="0.1"
+                defaultValue="0"
+                onChange={handleDrumTabScrub}
+              />
+              <span className="stem-time stem-time-right">{formatTime(drumTabDuration)}</span>
+            </div>
+            <div className="stem-playback-controls">
+              {drumTabIsPlaying ? (
+                <button type="button" onClick={pauseDrumTabPlayback}>⏸</button>
+              ) : (
+                <button type="button" onClick={() => startDrumTabPlayback()}>▶</button>
+              )}
+              <button type="button" className="btn-stop" onClick={handleDrumTabStop}>⏹</button>
+            </div>
+          </div>
+        )}
+
+        {drumTabText && (
+          <div className="tab-display">
+            <button
+              type="button"
+              className="tab-copy-btn"
+              onClick={() => navigator.clipboard.writeText(drumTabText)}
+            >
+              Copy Tab
+            </button>
+            <pre className="tab-pre">{drumTabText}</pre>
+          </div>
+        )}
+        </>}
       </section>
 
       <section className="card notes">
