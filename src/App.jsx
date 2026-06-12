@@ -1493,15 +1493,6 @@ function App() {
         )}
         </>}
       </section>
-
-      <section className="card notes">
-        <h2>Notes</h2>
-        <ul>
-          <li>This app separates local audio files directly in the browser using Demucs.</li>
-          <li>YouTube preview is for listening only; separation works on uploaded local files.</li>
-          <li>The first separation download is large (~172MB) and can take time.</li>
-        </ul>
-      </section>
     </div>
   );
 }
