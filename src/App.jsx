@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import separationWorkerUrl from './separationWorker.js?url';
+import separationWorkerUrl from './separationWorker.js?worker&url';
 
 const GUITAR_STRINGS = [
   { name: 'e', openMidi: 64 },
