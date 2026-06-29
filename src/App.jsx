@@ -206,6 +206,42 @@ function renderDrumTab(parts, duration) {
   return lines.join('\n');
 }
 
+// ── IndexedDB stem cache ─────────────────────────────────────────
+const DB_NAME = 'kappa-stems-cache';
+const STORE_NAME = 'stems';
+
+const openCacheDB = () => new Promise((resolve, reject) => {
+  const req = indexedDB.open(DB_NAME, 1);
+  req.onupgradeneeded = (e) => e.target.result.createObjectStore(STORE_NAME);
+  req.onsuccess = (e) => resolve(e.target.result);
+  req.onerror = (e) => reject(e.target.error);
+});
+
+const getCacheKey = (file) => `${file.name}__${file.size}__${file.lastModified}`;
+
+const loadStemsFromCache = async (file) => {
+  try {
+    const db = await openCacheDB();
+    return new Promise((resolve) => {
+      const req = db.transaction(STORE_NAME).objectStore(STORE_NAME).get(getCacheKey(file));
+      req.onsuccess = (e) => resolve(e.target.result ?? null);
+      req.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+};
+
+const saveStemsToCache = async (file, data) => {
+  try {
+    const db = await openCacheDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(data, getCacheKey(file));
+      tx.oncomplete = resolve;
+      tx.onerror = (e) => reject(e.target.error);
+    });
+  } catch { /* non-fatal */ }
+};
+
 const instrumentTypes = [
   { key: 'guitar', label: 'Guitar/Other', emoji: '🎸' },
   { key: 'bass',   label: 'Bass',         emoji: '🎵' },
@@ -225,6 +261,7 @@ function App() {
   const [audioUrl, setAudioUrl] = useState('');
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [fromCache, setFromCache] = useState(false);
   const [stems, setStems] = useState({ guitar: '', bass: '', drums: '', vocals: '' });
   const [isSeparated, setIsSeparated] = useState(false);
   const [tabText, setTabText] = useState('');
@@ -357,6 +394,7 @@ function App() {
     setAudioUrl(url);
     previousUrlsRef.current.push(url);
     setIsSeparated(false);
+    setFromCache(false);
     setStems({ guitar: '', bass: '', drums: '', vocals: '' });
     guitarStemRef.current = null;
     stemsDataRef.current = {};
@@ -441,24 +479,77 @@ function App() {
     }
   };
 
+  const applyStemResult = (result, sampleRate) => {
+    sampleRateRef.current = sampleRate;
+
+    const stemUrls = {};
+    for (const name of ['guitar', 'bass', 'drums', 'vocals']) {
+      stemUrls[name] = createStemUrl(result[name], sampleRate);
+    }
+
+    stemsDataRef.current = {};
+    stemBuffersRef.current = {};
+    for (const name of ['guitar', 'bass', 'drums', 'vocals']) {
+      stemsDataRef.current[name] = {
+        left: result[name].left instanceof Float32Array ? result[name].left : new Float32Array(result[name].left),
+        right: result[name].right instanceof Float32Array ? result[name].right : new Float32Array(result[name].right),
+        sampleRate,
+      };
+    }
+    stemDurationRef.current = stemsDataRef.current.guitar.left.length / sampleRate;
+
+    guitarStemRef.current = {
+      left: stemsDataRef.current.guitar.left,
+      right: stemsDataRef.current.guitar.right,
+      sampleRate,
+    };
+    setGuitarFileLabel('');
+    setGuitarDuration(stemsDataRef.current.guitar.left.length / sampleRate);
+
+    drumStemRef.current = {
+      left: stemsDataRef.current.drums.left,
+      right: stemsDataRef.current.drums.right,
+      sampleRate,
+    };
+    setDrumFileLabel('');
+    setDrumDuration(stemsDataRef.current.drums.left.length / sampleRate);
+
+    const allKeys = new Set(['guitar', 'bass', 'drums', 'vocals']);
+    setActiveStemKeys(allKeys);
+    activeStemKeysRef.current = new Set(allKeys);
+
+    setStems(stemUrls);
+    setIsSeparated(true);
+    setDisplayTime(0);
+    playOffsetRef.current = 0;
+    setProgress(1);
+  };
+
   const handleSeparate = async () => {
     if (!audioFile) return;
     setProcessing(true);
+    setFromCache(false);
     setProgress(0);
     setIsSeparated(false);
     resetPlayerState();
 
     try {
-      console.log('Starting separation...');
+      // Check IndexedDB cache first
+      const cached = await loadStemsFromCache(audioFile);
+      if (cached) {
+        setFromCache(true);
+        setProgress(1);
+        applyStemResult(cached, cached.sampleRate);
+        return;
+      }
+
       setProgress(0.1);
 
       const arrayBuffer = await audioFile.arrayBuffer();
-      console.log('Audio file loaded');
       setProgress(0.2);
 
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-      console.log('Audio decoded');
       setProgress(0.3);
 
       const left = audioBuffer.numberOfChannels > 0
@@ -468,7 +559,6 @@ function App() {
         ? audioBuffer.getChannelData(1)
         : left;
 
-      console.log('Starting processor.separate()...');
       setProgress(0.5);
 
       const result = await new Promise((resolve, reject) => {
@@ -488,7 +578,6 @@ function App() {
 
         const handleMessage = (event) => {
           const { type, result, error } = event.data;
-
           if (type === 'result') {
             clearTimeout(timeoutId);
             worker.removeEventListener('message', handleMessage);
@@ -501,11 +590,8 @@ function App() {
             reject(new Error(error));
           } else if (type === 'segmentProgress') {
             resetTimeout();
-            const { progress: segProg } = event.data;
-            setProgress(0.5 + segProg * 0.4);
-          } else if (type === 'status') {
-            resetTimeout();
-          } else if (type === 'downloadProgress') {
+            setProgress(0.5 + event.data.progress * 0.4);
+          } else if (type === 'status' || type === 'downloadProgress') {
             resetTimeout();
           }
         };
@@ -514,77 +600,35 @@ function App() {
           clearTimeout(timeoutId);
           worker.removeEventListener('message', handleMessage);
           worker.removeEventListener('error', handleError);
-          console.error(`Worker error event:`, error);
           reject(new Error(`Worker error: ${error.message || error}`));
         };
 
-        console.log('Setting up worker listeners...');
         worker.addEventListener('message', handleMessage);
         worker.addEventListener('error', handleError);
 
         const leftArray = new Float32Array(left);
         const rightArray = new Float32Array(right);
-
-        console.log(`Sending separate message to worker (left: ${leftArray.length}, right: ${rightArray.length})...`);
         worker.postMessage(
           { type: 'separate', data: { left: leftArray, right: rightArray } },
           [leftArray.buffer, rightArray.buffer]
         );
-        console.log('Separate message sent with transferable buffers');
       });
 
-      console.log('Separation complete, creating stem URLs...');
       setProgress(0.75);
 
       try {
         const sampleRate = audioBuffer.sampleRate;
-        sampleRateRef.current = sampleRate;
+        applyStemResult(result, sampleRate);
 
-        const stemUrls = {};
-        for (const name of ['guitar', 'bass', 'drums', 'vocals']) {
-          stemUrls[name] = createStemUrl(result[name], sampleRate);
-        }
-
-        // Store raw audio data for all stems for Web Audio playback
-        stemsDataRef.current = {};
-        stemBuffersRef.current = {};
-        for (const name of ['guitar', 'bass', 'drums', 'vocals']) {
-          stemsDataRef.current[name] = {
-            left: result[name].left instanceof Float32Array ? result[name].left : new Float32Array(result[name].left),
-            right: result[name].right instanceof Float32Array ? result[name].right : new Float32Array(result[name].right),
-            sampleRate,
-          };
-        }
-        stemDurationRef.current = stemsDataRef.current.guitar.left.length / sampleRate;
-
-        guitarStemRef.current = {
-          left: stemsDataRef.current.guitar.left,
-          right: stemsDataRef.current.guitar.right,
+        // Save to cache in the background — don't await so UI isn't blocked
+        saveStemsToCache(audioFile, {
           sampleRate,
-        };
-        setGuitarFileLabel('');
-        setGuitarDuration(stemsDataRef.current.guitar.left.length / sampleRate);
-
-        drumStemRef.current = {
-          left: stemsDataRef.current.drums.left,
-          right: stemsDataRef.current.drums.right,
-          sampleRate,
-        };
-        setDrumFileLabel('');
-        setDrumDuration(stemsDataRef.current.drums.left.length / sampleRate);
-
-        const allKeys = new Set(['guitar', 'bass', 'drums', 'vocals']);
-        setActiveStemKeys(allKeys);
-        activeStemKeysRef.current = new Set(allKeys);
-
-        setStems(stemUrls);
-        setIsSeparated(true);
-        setDisplayTime(0);
-        playOffsetRef.current = 0;
-        setProgress(1);
-        console.log('UI updated, separation complete');
+          guitar: { left: stemsDataRef.current.guitar.left, right: stemsDataRef.current.guitar.right },
+          bass:   { left: stemsDataRef.current.bass.left,   right: stemsDataRef.current.bass.right   },
+          drums:  { left: stemsDataRef.current.drums.left,  right: stemsDataRef.current.drums.right  },
+          vocals: { left: stemsDataRef.current.vocals.left, right: stemsDataRef.current.vocals.right },
+        });
       } catch (wavError) {
-        console.error('WAV creation error:', wavError);
         alert(`Failed to create WAV files: ${wavError.message}`);
       }
     } catch (error) {
@@ -592,7 +636,6 @@ function App() {
       alert(`Separation failed: ${error.message || error}`);
     } finally {
       setProcessing(false);
-      console.log('Separation process finished');
     }
   };
 
@@ -1113,6 +1156,43 @@ function App() {
     }
   };
 
+  const handleDownloadMix = () => {
+    const activeKeys = [...activeStemKeys];
+    if (activeKeys.length === 0) return;
+
+    const sampleRate = sampleRateRef.current;
+    const length = stemsDataRef.current[activeKeys[0]].left.length;
+    const mixed = { left: new Float32Array(length), right: new Float32Array(length) };
+
+    for (const key of activeKeys) {
+      const d = stemsDataRef.current[key];
+      for (let i = 0; i < length; i++) {
+        mixed.left[i] += d.left[i];
+        mixed.right[i] += d.right[i];
+      }
+    }
+
+    // Normalize if clipping
+    let peak = 0;
+    for (let i = 0; i < length; i++) {
+      peak = Math.max(peak, Math.abs(mixed.left[i]), Math.abs(mixed.right[i]));
+    }
+    if (peak > 1) {
+      for (let i = 0; i < length; i++) {
+        mixed.left[i] /= peak;
+        mixed.right[i] /= peak;
+      }
+    }
+
+    const blob = createWavBlob(mixed.left, mixed.right, sampleRate);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${audioName.replace(/\.[^.]+$/, '')}-mix.wav`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const activeStemLabels = [...activeStemKeys]
     .map((k) => instrumentTypes.find((i) => i.key === k)?.label)
     .filter(Boolean)
@@ -1164,7 +1244,7 @@ function App() {
               <span key={i} style={{ animationDelay: `${((i * 0.09) % 0.45).toFixed(2)}s` }} />
             ))}
           </div>
-          <p className="processing-status">Separating stems…</p>
+          <p className="processing-status">{fromCache ? 'Loading from cache…' : 'Separating stems…'}</p>
           {instrumentTypes.map(({ key, label, emoji }) => (
             <div key={key} className="skeleton-card">
               <div className="skeleton-icon" />
@@ -1239,6 +1319,14 @@ function App() {
               </button>
             )}
             <button type="button" className="btn-stop" onClick={handleStop}>⏹ Stop</button>
+            <button
+              type="button"
+              onClick={handleDownloadMix}
+              disabled={activeStemKeys.size === 0}
+              title="Download active stems mixed into one file"
+            >
+              ⬇
+            </button>
             {activeStemKeys.size > 0 ? (
               <span className="hint">{activeStemLabels}</span>
             ) : (
