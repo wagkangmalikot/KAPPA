@@ -1,210 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import separationWorkerUrl from './separationWorker.js?worker&url';
-
-const GUITAR_STRINGS = [
-  { name: 'e', openMidi: 64 },
-  { name: 'B', openMidi: 59 },
-  { name: 'G', openMidi: 55 },
-  { name: 'D', openMidi: 50 },
-  { name: 'A', openMidi: 45 },
-  { name: 'E', openMidi: 40 },
-];
-
-function findBestPosition(midiNotes) {
-  let bestPos = 0;
-  let bestCount = -1;
-  for (let pos = 0; pos <= 20; pos++) {
-    let count = 0;
-    for (const midi of midiNotes) {
-      for (const str of GUITAR_STRINGS) {
-        const fret = midi - str.openMidi;
-        if (fret >= pos && fret <= pos + 4) { count++; break; }
-      }
-    }
-    if (count > bestCount) { bestCount = count; bestPos = pos; }
-  }
-  return bestPos;
-}
-
-function midiToFret(midi, position) {
-  let inPos = null;
-  let fallback = null;
-  for (const str of GUITAR_STRINGS) {
-    const fret = midi - str.openMidi;
-    if (fret < 0 || fret > 24) continue;
-    if (fret >= position && fret <= position + 4) {
-      if (!inPos || fret < inPos.fret) inPos = { stringName: str.name, fret };
-    }
-    if (!fallback || fret < fallback.fret) fallback = { stringName: str.name, fret };
-  }
-  return inPos || fallback;
-}
-
-function renderAsciiTab(notes) {
-  const BIN_SIZE = 0.1;
-  const COLS_PER_LINE = 40;
-
-  const position = findBestPosition(notes.map((n) => n.pitchMidi));
-
-  const maxTime = Math.max(...notes.map((n) => n.startTimeSeconds));
-  const totalCols = Math.ceil(maxTime / BIN_SIZE) + 1;
-
-  const grid = GUITAR_STRINGS.map(() => new Array(totalCols).fill(null));
-
-  const binMap = new Map();
-  for (const note of notes) {
-    const col = Math.floor(note.startTimeSeconds / BIN_SIZE);
-    if (!binMap.has(col)) binMap.set(col, []);
-    binMap.get(col).push(note);
-  }
-
-  for (const [col, binNotes] of binMap) {
-    const sorted = [...binNotes].sort((a, b) => b.amplitude - a.amplitude);
-    const usedStrings = new Set();
-    for (const note of sorted) {
-      const candidates = [];
-      for (let i = 0; i < GUITAR_STRINGS.length; i++) {
-        const fret = note.pitchMidi - GUITAR_STRINGS[i].openMidi;
-        if (fret < 0 || fret > 24) continue;
-        candidates.push({ strIdx: i, fret, inPos: fret >= position && fret <= position + 4 });
-      }
-      const best =
-        candidates.find((c) => c.inPos && !usedStrings.has(c.strIdx)) ||
-        candidates.find((c) => !usedStrings.has(c.strIdx)) ||
-        candidates.find((c) => c.inPos) ||
-        candidates[0];
-      if (best) {
-        grid[best.strIdx][col] = best.fret;
-        usedStrings.add(best.strIdx);
-      }
-    }
-  }
-
-  const lines = [];
-  for (let lineStart = 0; lineStart < totalCols; lineStart += COLS_PER_LINE) {
-    const lineEnd = Math.min(lineStart + COLS_PER_LINE, totalCols);
-    for (let s = 0; s < GUITAR_STRINGS.length; s++) {
-      let row = `${GUITAR_STRINGS[s].name}|`;
-      for (let c = lineStart; c < lineEnd; c++) {
-        const fret = grid[s][c];
-        if (fret === null) {
-          row += '---';
-        } else {
-          const fretStr = String(fret);
-          row += fretStr.length === 1 ? `--${fretStr}` : `-${fretStr}`;
-        }
-      }
-      row += '|';
-      lines.push(row);
-    }
-    lines.push('');
-  }
-
-  return lines.join('\n');
-}
-
-// ── Drum detection ──────────────────────────────────────────────
-
-const DRUM_PARTS = [
-  { key: 'BD', lowFreq: 30,   highFreq: 250,  threshFactor: 4.0, minGap: 0.08 },
-  { key: 'SD', lowFreq: 250,  highFreq: 5000, threshFactor: 3.5, minGap: 0.07 },
-  { key: 'HH', lowFreq: 7000, highFreq: null, threshFactor: 3.0, minGap: 0.04 },
-];
-
-async function filterBand(mono, sampleRate, lowFreq, highFreq) {
-  const ctx = new OfflineAudioContext(1, mono.length, sampleRate);
-  const buf = ctx.createBuffer(1, mono.length, sampleRate);
-  buf.copyToChannel(mono, 0);
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  let node = src;
-  if (lowFreq) {
-    const hpf = ctx.createBiquadFilter();
-    hpf.type = 'highpass';
-    hpf.frequency.value = lowFreq;
-    hpf.Q.value = 0.7;
-    node.connect(hpf);
-    node = hpf;
-  }
-  if (highFreq) {
-    const lpf = ctx.createBiquadFilter();
-    lpf.type = 'lowpass';
-    lpf.frequency.value = highFreq;
-    lpf.Q.value = 0.7;
-    node.connect(lpf);
-    node = lpf;
-  }
-  node.connect(ctx.destination);
-  src.start();
-  const out = await ctx.startRendering();
-  return out.getChannelData(0);
-}
-
-function onsetsFromEnergy(data, sampleRate, threshFactor, minGapSec) {
-  const FRAME = 512;
-  const HOP = 256;
-  const minGapFrames = Math.ceil((minGapSec * sampleRate) / HOP);
-
-  const energies = [];
-  for (let i = 0; i + FRAME <= data.length; i += HOP) {
-    let e = 0;
-    for (let j = 0; j < FRAME; j++) e += data[i + j] ** 2;
-    energies.push(Math.sqrt(e / FRAME));
-  }
-
-  // Positive spectral flux — better onset sensitivity than raw energy
-  const flux = energies.map((e, i) => (i > 0 ? Math.max(0, e - energies[i - 1]) : 0));
-
-  const LOOKBACK = 20;
-  const onsets = [];
-  let lastFrame = -minGapFrames;
-
-  for (let i = 2; i < flux.length - 1; i++) {
-    const local = flux.slice(Math.max(0, i - LOOKBACK), i);
-    const mean = local.reduce((s, v) => s + v, 0) / local.length;
-    const std = Math.sqrt(local.reduce((s, v) => s + (v - mean) ** 2, 0) / local.length);
-    const threshold = mean + threshFactor * std;
-    if (
-      flux[i] > threshold &&
-      flux[i] >= flux[i - 1] &&
-      flux[i] >= flux[i + 1] &&
-      i - lastFrame >= minGapFrames
-    ) {
-      onsets.push((i * HOP) / sampleRate);
-      lastFrame = i;
-    }
-  }
-  return onsets;
-}
-
-function renderDrumTab(parts, duration) {
-  const BIN_SIZE = 0.05;
-  const COLS_PER_LINE = 64;
-  const partOrder = ['HH', 'SD', 'BD'];
-  const totalCols = Math.ceil(duration / BIN_SIZE);
-
-  const grids = {};
-  for (const part of partOrder) {
-    grids[part] = new Array(totalCols).fill(false);
-    for (const t of (parts[part] || [])) {
-      const col = Math.floor(t / BIN_SIZE);
-      if (col >= 0 && col < totalCols) grids[part][col] = true;
-    }
-  }
-
-  const lines = [];
-  for (let lineStart = 0; lineStart < totalCols; lineStart += COLS_PER_LINE) {
-    const lineEnd = Math.min(lineStart + COLS_PER_LINE, totalCols);
-    for (const part of partOrder) {
-      let row = `${part}|`;
-      for (let c = lineStart; c < lineEnd; c++) row += grids[part][c] ? 'x' : '-';
-      row += '|';
-      lines.push(row);
-    }
-    lines.push('');
-  }
-  return lines.join('\n');
-}
+import { notesToTab, SUBDIVISIONS } from './tabGenerator';
+import { useTabStore } from './tabStore';
+import { StringSelector } from './components/StringSelector';
+import { TransportBar } from './components/TransportBar';
+import { TabTimeline } from './components/TabTimeline';
+import { TabGrid } from './components/TabGrid';
+import { ChordSheet } from './components/ChordSheet';
+import { useTabAudio } from './hooks/useTabAudio';
 
 // ── IndexedDB stem cache ─────────────────────────────────────────
 const DB_NAME = 'kappa-stems-cache';
@@ -264,10 +67,13 @@ function App() {
   const [fromCache, setFromCache] = useState(false);
   const [stems, setStems] = useState({ guitar: '', bass: '', drums: '', vocals: '' });
   const [isSeparated, setIsSeparated] = useState(false);
-  const [tabText, setTabText] = useState('');
   const [tabProcessing, setTabProcessing] = useState(false);
   const [tabProgress, setTabProgress] = useState(0);
   const [tabError, setTabError] = useState('');
+  const { seekTo: tabSeekTo } = useTabAudio();
+  const { clearTab } = useTabStore();
+  const leadIsEmpty   = useTabStore(s => s.leadTab.every(r => r.every(c => c === null)));
+  const rhythmIsEmpty = useTabStore(s => s.rhythmTab.every(r => r.every(c => c === null)));
   const [guitarFileLabel, setGuitarFileLabel] = useState('');
   const [guitarDuration, setGuitarDuration] = useState(0);
   const [tabStartSec, setTabStartSec] = useState(0);
@@ -276,20 +82,27 @@ function App() {
   const [tabDisplayTime, setTabDisplayTime] = useState(0);
   const [tabDuration, setTabDuration] = useState(0);
 
-  const [activeTabSection, setActiveTabSection] = useState('guitar');
+  const [activeTabSection, setActiveTabSection] = useState('stems');
+  const [tabView, setTabView] = useState('both');
 
-  // Drum tab
-  const [drumTabText, setDrumTabText] = useState('');
-  const [drumTabProcessing, setDrumTabProcessing] = useState(false);
-  const [drumTabProgress, setDrumTabProgress] = useState(0);
-  const [drumTabError, setDrumTabError] = useState('');
-  const [drumFileLabel, setDrumFileLabel] = useState('');
-  const [drumDuration, setDrumDuration] = useState(0);
-  const [drumTabStartSec, setDrumTabStartSec] = useState(0);
-  const [drumTabEndSec, setDrumTabEndSec] = useState(0);
-  const [drumTabIsPlaying, setDrumTabIsPlaying] = useState(false);
-  const [drumTabDisplayTime, setDrumTabDisplayTime] = useState(0);
-  const [drumTabDuration, setDrumTabDuration] = useState(0);
+  // Lyrics
+  const [lyricsLines, setLyricsLines] = useState([]);
+  const [lyricsQuery, setLyricsQuery] = useState('');
+  const [lyricsSearching, setLyricsSearching] = useState(false);
+  const [lyricsDetecting, setLyricsDetecting] = useState(false);
+  const [lyricsStatus, setLyricsStatus] = useState('');
+  const [lyricsError, setLyricsError] = useState('');
+  const [lyricsSource, setLyricsSource] = useState('');
+
+  // Chord detection
+  const [chordResults, setChordResults] = useState([]);
+  const [chordProcessing, setChordProcessing] = useState(false);
+  const [chordProgress, setChordProgress] = useState(0);
+  const [chordError, setChordError] = useState('');
+  const [chordFileLabel, setChordFileLabel] = useState('');
+  const [chordDuration, setChordDuration] = useState(0);
+  const [chordStartSec, setChordStartSec] = useState(0);
+  const [chordEndSec, setChordEndSec] = useState(0);
 
   // Stem player
   const [activeStemKeys, setActiveStemKeys] = useState(new Set());
@@ -307,17 +120,10 @@ function App() {
   const rangeRef = useRef(null);
   const draggingHandleRef = useRef(null);
 
-  const drumStemRef = useRef(null);
-  const drumTabSliceRef = useRef(null);
-  const drumTabAudioBufRef = useRef(null);
-  const drumTabCtxRef = useRef(null);
-  const drumTabSrcRef = useRef(null);
-  const drumTabRafRef = useRef(null);
-  const drumTabScrubberRef = useRef(null);
-  const drumTabPlayStartCtxRef = useRef(0);
-  const drumTabPlayOffsetRef = useRef(0);
-  const drumRangeRef = useRef(null);
-  const drumDraggingHandleRef = useRef(null);
+  const lyricsWorkerRef = useRef(null);
+  const chordStemRef = useRef(null);
+  const chordRangeRef = useRef(null);
+  const chordDraggingRef = useRef(null);
 
   const processorRef = useRef(null);
   const previousUrlsRef = useRef([]);
@@ -344,8 +150,6 @@ function App() {
       audioCtxRef.current?.close();
       stopTabNodes();
       tabCtxRef.current?.close();
-      stopDrumTabNodes();
-      drumTabCtxRef.current?.close();
     };
   }, []);
 
@@ -357,11 +161,16 @@ function App() {
   }, [guitarDuration]);
 
   useEffect(() => {
-    if (drumDuration > 0) {
-      setDrumTabStartSec(0);
-      setDrumTabEndSec(drumDuration);
+    const dur = chordDuration > 0 ? chordDuration : guitarDuration;
+    if (dur > 0) {
+      setChordStartSec(0);
+      setChordEndSec(dur);
     }
-  }, [drumDuration]);
+  }, [chordDuration, guitarDuration]);
+
+  useEffect(() => {
+    if (import.meta.env.DEV) window.__setChordResults = setChordResults;
+  }, []);
 
   const clearPreviousUrls = () => {
     previousUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -383,11 +192,12 @@ function App() {
     if (scrubberRef.current) scrubberRef.current.value = '0';
   };
 
-  const handleMainFile = (event) => {
+  const handleMainFile = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
     clearPreviousUrls();
     resetPlayerState();
+    stopTabNodes();
     const url = URL.createObjectURL(file);
     setAudioFile(file);
     setAudioName(file.name);
@@ -397,12 +207,97 @@ function App() {
     setFromCache(false);
     setStems({ guitar: '', bass: '', drums: '', vocals: '' });
     guitarStemRef.current = null;
+    chordStemRef.current = null;
     stemsDataRef.current = {};
     stemBuffersRef.current = {};
     stemDurationRef.current = 0;
     setActiveStemKeys(new Set());
     activeStemKeysRef.current = new Set();
     setProgress(0);
+    // Reset guitar tab / chord state
+    setGuitarDuration(0);
+    setTabDuration(0);
+    tabSliceRef.current = null;
+    tabAudioBufRef.current = null;
+    setTabIsPlaying(false);
+    setTabDisplayTime(0);
+    tabPlayOffsetRef.current = 0;
+    setChordDuration(0);
+    setChordResults([]);
+    // Auto-decode the file so Guitar Tab and Chords tabs get audio immediately
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const audioContext = new AudioContext();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      await audioContext.close();
+      const left = audioBuffer.getChannelData(0);
+      const right = audioBuffer.numberOfChannels > 1
+        ? audioBuffer.getChannelData(1)
+        : audioBuffer.getChannelData(0);
+      const monoFull = new Float32Array(left.length);
+      for (let i = 0; i < left.length; i++) monoFull[i] = (left[i] + right[i]) / 2;
+      const stemData = {
+        left: new Float32Array(left),
+        right: new Float32Array(right),
+        sampleRate: audioBuffer.sampleRate,
+      };
+      guitarStemRef.current = stemData;
+      chordStemRef.current = stemData;
+      tabSliceRef.current = { mono: monoFull, sampleRate: audioBuffer.sampleRate, duration: audioBuffer.duration };
+      setGuitarDuration(audioBuffer.duration);
+      setTabDuration(audioBuffer.duration);
+    } catch (err) {
+      console.error('Could not pre-decode audio:', err);
+    }
+  };
+
+  const handleReset = () => {
+    clearPreviousUrls();
+    resetPlayerState();
+    stopTabNodes();
+    audioCtxRef.current?.close();
+    setAudioFile(null);
+    setAudioName('');
+    setAudioUrl('');
+    setIsSeparated(false);
+    setFromCache(false);
+    setProcessing(false);
+    setProgress(0);
+    setStems({ guitar: '', bass: '', drums: '', vocals: '' });
+    guitarStemRef.current = null;
+    stemsDataRef.current = {};
+    stemBuffersRef.current = {};
+    stemDurationRef.current = 0;
+    setActiveStemKeys(new Set());
+    activeStemKeysRef.current = new Set();
+    setGuitarFileLabel('');
+    setGuitarDuration(0);
+    setTabStartSec(0);
+    setTabEndSec(0);
+    setTabIsPlaying(false);
+    setTabDisplayTime(0);
+    setTabDuration(0);
+    tabSliceRef.current = null;
+    tabAudioBufRef.current = null;
+    tabPlayOffsetRef.current = 0;
+    setTabProcessing(false);
+    setTabProgress(0);
+    setTabError('');
+    setChordResults([]);
+    setChordProcessing(false);
+    setChordProgress(0);
+    setChordError('');
+    setChordFileLabel('');
+    setChordDuration(0);
+    setChordStartSec(0);
+    setChordEndSec(0);
+    chordStemRef.current = null;
+    setLyricsLines([]);
+    setLyricsQuery('');
+    setLyricsStatus('');
+    setLyricsError('');
+    setLyricsSource('');
+    clearTab();
   };
 
   const initializeWorker = () => {
@@ -411,9 +306,6 @@ function App() {
   };
 
   const createWavBlob = (left, right, sampleRate) => {
-    console.log(`Creating WAV blob for audio length: ${left.length}`);
-    const startTime = Date.now();
-
     const numChannels = 2;
     const bytesPerSample = 2;
     const blockAlign = numChannels * bytesPerSample;
@@ -453,22 +345,14 @@ function App() {
       offset += 2;
     }
 
-    const blob = new Blob([view], { type: 'audio/wav' });
-    const elapsed = Date.now() - startTime;
-    console.log(`WAV blob created in ${elapsed}ms (size: ${(blob.size / 1024 / 1024).toFixed(2)}MB)`);
-
-    return blob;
+    return new Blob([view], { type: 'audio/wav' });
   };
 
   const createStemUrl = (stem, sampleRate) => {
-    if (!stem || !stem.left || !stem.right) {
-      console.warn('Invalid stem data:', stem);
-      return '';
-    }
+    if (!stem || !stem.left || !stem.right) return '';
     try {
       const leftArray = stem.left instanceof Float32Array ? stem.left : new Float32Array(stem.left);
       const rightArray = stem.right instanceof Float32Array ? stem.right : new Float32Array(stem.right);
-
       const blob = createWavBlob(leftArray, rightArray, sampleRate);
       const url = URL.createObjectURL(blob);
       previousUrlsRef.current.push(url);
@@ -506,14 +390,6 @@ function App() {
     setGuitarFileLabel('');
     setGuitarDuration(stemsDataRef.current.guitar.left.length / sampleRate);
 
-    drumStemRef.current = {
-      left: stemsDataRef.current.drums.left,
-      right: stemsDataRef.current.drums.right,
-      sampleRate,
-    };
-    setDrumFileLabel('');
-    setDrumDuration(stemsDataRef.current.drums.left.length / sampleRate);
-
     const allKeys = new Set(['guitar', 'bass', 'drums', 'vocals']);
     setActiveStemKeys(allKeys);
     activeStemKeysRef.current = new Set(allKeys);
@@ -534,7 +410,6 @@ function App() {
     resetPlayerState();
 
     try {
-      // Check IndexedDB cache first
       const cached = await loadStemsFromCache(audioFile);
       if (cached) {
         setFromCache(true);
@@ -544,7 +419,6 @@ function App() {
       }
 
       setProgress(0.1);
-
       const arrayBuffer = await audioFile.arrayBuffer();
       setProgress(0.2);
 
@@ -563,7 +437,6 @@ function App() {
 
       const result = await new Promise((resolve, reject) => {
         const worker = initializeWorker();
-
         const SEGMENT_TIMEOUT = 600000;
         let timeoutId = setTimeout(() => {
           reject(new Error('Separation timeout: no progress for 10 minutes'));
@@ -619,8 +492,6 @@ function App() {
       try {
         const sampleRate = audioBuffer.sampleRate;
         applyStemResult(result, sampleRate);
-
-        // Save to cache in the background — don't await so UI isn't blocked
         saveStemsToCache(audioFile, {
           sampleRate,
           guitar: { left: stemsDataRef.current.guitar.left, right: stemsDataRef.current.guitar.right },
@@ -666,7 +537,6 @@ function App() {
 
   const startPlayback = (offset = playOffsetRef.current) => {
     stopNodes();
-
     const activeKeys = [...activeStemKeysRef.current];
     if (activeKeys.length === 0) return;
 
@@ -686,13 +556,11 @@ function App() {
       src.connect(ctx.destination);
       nodes.push(src);
     }
-
     if (nodes.length === 0) return;
 
     const startAt = ctx.currentTime + 0.05;
     nodes.forEach((n) => n.start(startAt, offset));
     sourceNodesRef.current = nodes;
-    // playbackStartCtxTimeRef tracks the ctx time that corresponds to track position 0
     playbackStartCtxTimeRef.current = startAt - offset;
 
     const duration = stemDurationRef.current;
@@ -700,6 +568,13 @@ function App() {
       const t = Math.min(ctx.currentTime - playbackStartCtxTimeRef.current, duration);
       setDisplayTime(t);
       if (scrubberRef.current) scrubberRef.current.value = String(t);
+      // Sync tab timeline playhead with stem playback time
+      const { bpm: sBpm, totalBeats: sTotalBeats, setPlayheadBeat } = useTabStore.getState();
+      const tabRelT = t - tabStartSec;
+      if (sTotalBeats > 0 && tabRelT >= 0) {
+        const beat = Math.min(sTotalBeats - 1, Math.floor(tabRelT * ((sBpm || 120) / 60) * SUBDIVISIONS));
+        setPlayheadBeat(beat);
+      }
       if (t < duration) {
         rafRef.current = requestAnimationFrame(tick);
       } else {
@@ -780,6 +655,9 @@ function App() {
       const t = Math.min(ctx.currentTime - tabPlayStartCtxRef.current, duration);
       setTabDisplayTime(t);
       if (tabScrubberRef.current) tabScrubberRef.current.value = String(t);
+      const { bpm, totalBeats, setPlayheadBeat } = useTabStore.getState();
+      const beat = Math.min(totalBeats - 1, Math.floor(t * ((bpm || 120) / 60) * SUBDIVISIONS));
+      if (beat >= 0) setPlayheadBeat(beat);
       if (t < duration) {
         tabRafRef.current = requestAnimationFrame(tick);
       } else {
@@ -788,6 +666,7 @@ function App() {
         setTabDisplayTime(0);
         tabPlayOffsetRef.current = 0;
         if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
+        useTabStore.getState().setPlayheadBeat(0);
       }
     };
     tabRafRef.current = requestAnimationFrame(tick);
@@ -819,156 +698,202 @@ function App() {
     const newTime = parseFloat(e.target.value);
     tabPlayOffsetRef.current = newTime;
     setTabDisplayTime(newTime);
+    const { bpm, totalBeats, setPlayheadBeat } = useTabStore.getState();
+    const beat = Math.min(totalBeats - 1, Math.max(0, Math.floor(newTime * ((bpm || 120) / 60) * SUBDIVISIONS)));
+    setPlayheadBeat(beat);
     if (tabIsPlaying) startTabPlayback(newTime);
   };
 
-  // ── Drum tab player ─────────────────────────────────────────────
+  // ── Lyrics ──────────────────────────────────────────────────────
 
-  const stopDrumTabNodes = () => {
-    try { drumTabSrcRef.current?.stop(); } catch {}
-    drumTabSrcRef.current = null;
-    if (drumTabRafRef.current) cancelAnimationFrame(drumTabRafRef.current);
-    drumTabRafRef.current = null;
-  };
+  function parseLRC(text) {
+    const lines = [];
+    for (const line of text.split('\n')) {
+      const m = line.match(/^\[(\d{1,2}):(\d{2}(?:\.\d+)?)\](.*)/);
+      if (!m) continue;
+      const start = parseInt(m[1]) * 60 + parseFloat(m[2]);
+      const str = m[3].trim();
+      if (str) lines.push({ text: str, start, end: null });
+    }
+    for (let i = 0; i < lines.length - 1; i++) lines[i].end = lines[i + 1].start;
+    if (lines.length) lines[lines.length - 1].end = lines[lines.length - 1].start + 4;
+    return lines;
+  }
 
-  const startDrumTabPlayback = (offset = drumTabPlayOffsetRef.current) => {
-    stopDrumTabNodes();
-    const slice = drumTabSliceRef.current;
-    if (!slice) return;
-    if (!drumTabCtxRef.current || drumTabCtxRef.current.state === 'closed') {
-      drumTabCtxRef.current = new AudioContext();
-      drumTabAudioBufRef.current = null;
-    }
-    const ctx = drumTabCtxRef.current;
-    if (ctx.state === 'suspended') ctx.resume();
-    if (!drumTabAudioBufRef.current) {
-      const buf = ctx.createBuffer(1, slice.mono.length, slice.sampleRate);
-      buf.copyToChannel(slice.mono, 0);
-      drumTabAudioBufRef.current = buf;
-    }
-    const src = ctx.createBufferSource();
-    src.buffer = drumTabAudioBufRef.current;
-    src.connect(ctx.destination);
-    const startAt = ctx.currentTime + 0.05;
-    src.start(startAt, offset);
-    drumTabSrcRef.current = src;
-    drumTabPlayStartCtxRef.current = startAt - offset;
-    const duration = slice.duration;
-    const tick = () => {
-      const t = Math.min(ctx.currentTime - drumTabPlayStartCtxRef.current, duration);
-      setDrumTabDisplayTime(t);
-      if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = String(t);
-      if (t < duration) {
-        drumTabRafRef.current = requestAnimationFrame(tick);
+  function wordsToLines(words) {
+    const lines = [];
+    let cur = null;
+    for (const w of words) {
+      if (!cur) {
+        cur = { text: w.word, start: w.start, end: w.end };
+      } else if (w.start - cur.end > 0.8) {
+        lines.push(cur);
+        cur = { text: w.word, start: w.start, end: w.end };
       } else {
-        stopDrumTabNodes();
-        setDrumTabIsPlaying(false);
-        setDrumTabDisplayTime(0);
-        drumTabPlayOffsetRef.current = 0;
-        if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
+        cur.text += ' ' + w.word;
+        cur.end = w.end;
       }
-    };
-    drumTabRafRef.current = requestAnimationFrame(tick);
-    setDrumTabIsPlaying(true);
-  };
-
-  const pauseDrumTabPlayback = () => {
-    const ctx = drumTabCtxRef.current;
-    let offset = drumTabPlayOffsetRef.current;
-    if (ctx) {
-      offset = Math.min(ctx.currentTime - drumTabPlayStartCtxRef.current, drumTabSliceRef.current?.duration || 0);
-      drumTabPlayOffsetRef.current = offset;
     }
-    stopDrumTabNodes();
-    setDrumTabIsPlaying(false);
-    setDrumTabDisplayTime(offset);
-    if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = String(offset);
-  };
+    if (cur) lines.push(cur);
+    return lines;
+  }
 
-  const handleDrumTabStop = () => {
-    stopDrumTabNodes();
-    setDrumTabIsPlaying(false);
-    setDrumTabDisplayTime(0);
-    drumTabPlayOffsetRef.current = 0;
-    if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
-  };
-
-  const handleDrumTabScrub = (e) => {
-    const t = parseFloat(e.target.value);
-    drumTabPlayOffsetRef.current = t;
-    setDrumTabDisplayTime(t);
-    if (drumTabIsPlaying) startDrumTabPlayback(t);
-  };
-
-  // ── Drum range selector ──────────────────────────────────────────
-
-  const handleDrumRangePointerDown = (e) => {
-    const handle = e.target.closest('[data-handle]');
-    if (!handle) return;
-    drumDraggingHandleRef.current = handle.dataset.handle;
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-
-  const handleDrumRangePointerMove = (e) => {
-    if (!drumDraggingHandleRef.current || !drumRangeRef.current) return;
-    const rect = drumRangeRef.current.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const time = pct * drumDuration;
-    if (drumDraggingHandleRef.current === 'start') {
-      setDrumTabStartSec(Math.min(time, drumTabEndSec - 0.5));
-    } else {
-      setDrumTabEndSec(Math.max(time, drumTabStartSec + 0.5));
+  const searchLyrics = async () => {
+    const q = lyricsQuery.trim();
+    if (!q) return;
+    setLyricsSearching(true);
+    setLyricsError('');
+    setLyricsLines([]);
+    setLyricsSource('');
+    try {
+      const res = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
+      if (!res.ok) throw new Error(`LRClib ${res.status}`);
+      const results = await res.json();
+      const match = results.find(r => r.syncedLyrics);
+      if (!match) {
+        setLyricsError('No synced lyrics found on LRClib. Try a different title or detect from audio below.');
+        return;
+      }
+      const lines = parseLRC(match.syncedLyrics);
+      setLyricsLines(lines);
+      setLyricsSource(`"${match.trackName}" by ${match.artistName} (LRClib)`);
+    } catch (err) {
+      setLyricsError(`Search failed: ${err.message}`);
+    } finally {
+      setLyricsSearching(false);
     }
   };
 
-  const handleDrumRangePointerUp = () => { drumDraggingHandleRef.current = null; };
+  const detectLyricsFromAudio = async () => {
+    let sourceData = null;
+    if (stemsDataRef.current?.vocals) {
+      const v = stemsDataRef.current.vocals;
+      sourceData = { left: v.left, right: v.right, sampleRate: v.sampleRate };
+    } else if (audioFile) {
+      try {
+        const ab = await audioFile.arrayBuffer();
+        const ctx = new AudioContext();
+        const buf = await ctx.decodeAudioData(ab);
+        await ctx.close();
+        sourceData = {
+          left: buf.getChannelData(0),
+          right: buf.numberOfChannels > 1 ? buf.getChannelData(1) : buf.getChannelData(0),
+          sampleRate: buf.sampleRate,
+        };
+      } catch { /* fall through */ }
+    }
+    if (!sourceData && guitarStemRef.current) sourceData = guitarStemRef.current;
+    if (!sourceData) {
+      setLyricsError('No audio loaded. Upload a song or separate stems first.');
+      return;
+    }
 
-  // ── Drum file upload ─────────────────────────────────────────────
+    setLyricsDetecting(true);
+    setLyricsError('');
+    setLyricsLines([]);
+    setLyricsSource('');
+    setLyricsStatus('Preparing audio…');
 
-  const handleDrumFile = async (event) => {
+    try {
+      const { left, right, sampleRate } = sourceData;
+      const mono = new Float32Array(left.length);
+      for (let i = 0; i < left.length; i++) mono[i] = (left[i] + right[i]) / 2;
+      const targetSR = 16000;
+      const targetLen = Math.floor(mono.length * targetSR / sampleRate);
+      const offCtx = new OfflineAudioContext(1, targetLen, targetSR);
+      const inBuf = offCtx.createBuffer(1, mono.length, sampleRate);
+      inBuf.copyToChannel(mono, 0);
+      const src = offCtx.createBufferSource();
+      src.buffer = inBuf;
+      src.connect(offCtx.destination);
+      src.start();
+      const resampled = await offCtx.startRendering();
+      const audio16k = new Float32Array(resampled.getChannelData(0));
+
+      if (!lyricsWorkerRef.current) {
+        lyricsWorkerRef.current = new Worker(
+          new URL('./lyricsWorker.js', import.meta.url),
+          { type: 'module' }
+        );
+      }
+
+      const words = await new Promise((resolve, reject) => {
+        const worker = lyricsWorkerRef.current;
+        const handler = ({ data }) => {
+          if (data.type === 'status') {
+            setLyricsStatus(data.msg);
+          } else if (data.type === 'dl') {
+            if (data.p?.status === 'progress') {
+              setLyricsStatus(`Downloading model… ${Math.round(data.p.progress ?? 0)}%`);
+            }
+          } else if (data.type === 'result') {
+            worker.removeEventListener('message', handler);
+            resolve(data.words);
+          } else if (data.type === 'error') {
+            worker.removeEventListener('message', handler);
+            reject(new Error(data.message));
+          }
+        };
+        worker.addEventListener('message', handler);
+        worker.postMessage({ type: 'transcribe', audio: audio16k }, [audio16k.buffer]);
+      });
+
+      const lines = wordsToLines(words);
+      setLyricsLines(lines);
+      setLyricsSource(`Detected via Whisper (${lines.length} lines)`);
+      setLyricsStatus('');
+    } catch (err) {
+      setLyricsError(err.message);
+      setLyricsStatus('');
+    } finally {
+      setLyricsDetecting(false);
+    }
+  };
+
+  // ── Chord detection ──────────────────────────────────────────────
+
+  const handleChordFile = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    setDrumTabText('');
-    setDrumTabError('');
-    setDrumTabDuration(0);
-    drumTabSliceRef.current = null;
-    drumTabAudioBufRef.current = null;
-    stopDrumTabNodes();
-    setDrumTabIsPlaying(false);
-    setDrumTabDisplayTime(0);
-    drumTabPlayOffsetRef.current = 0;
+    setChordResults([]);
+    setChordError('');
+    setChordDuration(0);
     try {
       const arrayBuffer = await file.arrayBuffer();
       const audioCtx = new AudioContext();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      const left = audioBuffer.numberOfChannels > 0 ? audioBuffer.getChannelData(0) : new Float32Array(audioBuffer.length);
-      const right = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : left;
-      drumStemRef.current = {
+      const left = audioBuffer.numberOfChannels > 0
+        ? audioBuffer.getChannelData(0)
+        : new Float32Array(audioBuffer.length);
+      const right = audioBuffer.numberOfChannels > 1
+        ? audioBuffer.getChannelData(1)
+        : left;
+      chordStemRef.current = {
         left: new Float32Array(left),
         right: new Float32Array(right),
         sampleRate: audioBuffer.sampleRate,
       };
-      setDrumFileLabel(file.name);
-      setDrumDuration(audioBuffer.duration);
+      setChordFileLabel(file.name);
+      setChordDuration(audioBuffer.duration);
     } catch (err) {
-      setDrumTabError(`Could not decode audio file: ${err.message}`);
+      setChordError(`Could not decode audio file: ${err.message}`);
     }
   };
 
-  // ── Drum tab detection ───────────────────────────────────────────
-
-  const detectDrumTab = async () => {
-    const stemData = drumStemRef.current;
+  const detectChordsHandler = async () => {
+    const stemData = chordStemRef.current ?? guitarStemRef.current;
     if (!stemData) return;
-    setDrumTabProcessing(true);
-    setDrumTabProgress(0);
-    setDrumTabError('');
-    setDrumTabText('');
+    setChordProcessing(true);
+    setChordProgress(0);
+    setChordError('');
+    setChordResults([]);
     try {
+      const { detectChords } = await import('./chordDetector.js');
       const { left, right, sampleRate } = stemData;
       const fullDuration = left.length / sampleRate;
-      const startSec = Math.max(0, drumTabStartSec);
-      const endSec = Math.min(fullDuration, drumTabEndSec > 0 ? drumTabEndSec : fullDuration);
+      const dur = chordDuration > 0 ? chordDuration : guitarDuration;
+      const startSec = Math.max(0, chordStartSec);
+      const endSec = Math.min(fullDuration, chordEndSec > 0 && chordEndSec <= dur ? chordEndSec : fullDuration);
       const startSample = Math.floor(startSec * sampleRate);
       const endSample = Math.floor(endSec * sampleRate);
 
@@ -977,37 +902,55 @@ function App() {
         mono[i - startSample] = (left[i] + right[i]) / 2;
       }
 
-      stopDrumTabNodes();
-      drumTabSliceRef.current = { mono: new Float32Array(mono), sampleRate, duration: mono.length / sampleRate };
-      drumTabAudioBufRef.current = null;
-      setDrumTabDuration(mono.length / sampleRate);
-      setDrumTabIsPlaying(false);
-      setDrumTabDisplayTime(0);
-      drumTabPlayOffsetRef.current = 0;
-      if (drumTabScrubberRef.current) drumTabScrubberRef.current.value = '0';
+      const targetSR = 11025;
+      const targetLength = Math.floor(mono.length * targetSR / sampleRate);
+      const tmpCtx = new AudioContext();
+      const inputBuffer = tmpCtx.createBuffer(1, mono.length, sampleRate);
+      inputBuffer.copyToChannel(mono, 0);
+      const offlineCtx = new OfflineAudioContext(1, targetLength, targetSR);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = inputBuffer;
+      source.connect(offlineCtx.destination);
+      source.start();
+      const resampled = await offlineCtx.startRendering();
+      await tmpCtx.close();
 
-      const parts = {};
-      for (let pi = 0; pi < DRUM_PARTS.length; pi++) {
-        const { key, lowFreq, highFreq, threshFactor, minGap } = DRUM_PARTS[pi];
-        setDrumTabProgress((pi + 0.5) / DRUM_PARTS.length);
-        const filtered = await filterBand(mono, sampleRate, lowFreq, highFreq);
-        parts[key] = onsetsFromEnergy(filtered, sampleRate, threshFactor, minGap);
-      }
-      setDrumTabProgress(1);
+      const segments = await detectChords(resampled.getChannelData(0), targetSR, setChordProgress);
 
-      const allEmpty = Object.values(parts).every((v) => v.length === 0);
-      if (allEmpty) {
-        setDrumTabError('No drum hits detected. Try a shorter or louder segment.');
+      if (segments.length === 0) {
+        setChordError('No chords detected. Try a longer segment or audio with clear harmonic content.');
       } else {
-        setDrumTabText(renderDrumTab(parts, mono.length / sampleRate));
+        setChordResults(segments);
       }
     } catch (err) {
-      console.error('Drum tab error:', err);
-      setDrumTabError(`Detection failed: ${err.message}`);
+      console.error('Chord detection error:', err);
+      setChordError(`Chord detection failed: ${err.message}`);
     } finally {
-      setDrumTabProcessing(false);
+      setChordProcessing(false);
     }
   };
+
+  const handleChordRangePointerDown = (e) => {
+    const handle = e.target.closest('[data-handle]');
+    if (!handle) return;
+    chordDraggingRef.current = handle.dataset.handle;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handleChordRangePointerMove = (e) => {
+    if (!chordDraggingRef.current || !chordRangeRef.current) return;
+    const effectiveDur = chordDuration > 0 ? chordDuration : guitarDuration;
+    const rect = chordRangeRef.current.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const time = pct * effectiveDur;
+    if (chordDraggingRef.current === 'start') {
+      setChordStartSec(Math.min(time, chordEndSec - 0.5));
+    } else {
+      setChordEndSec(Math.max(time, chordStartSec + 0.5));
+    }
+  };
+
+  const handleChordRangePointerUp = () => { chordDraggingRef.current = null; };
 
   const handleRangePointerDown = (e) => {
     const handle = e.target.closest('[data-handle]');
@@ -1028,14 +971,11 @@ function App() {
     }
   };
 
-  const handleRangePointerUp = () => {
-    draggingHandleRef.current = null;
-  };
+  const handleRangePointerUp = () => { draggingHandleRef.current = null; };
 
   const handleGuitarFile = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    setTabText('');
     setTabError('');
     setTabDuration(0);
     tabSliceRef.current = null;
@@ -1044,6 +984,7 @@ function App() {
     setTabIsPlaying(false);
     setTabDisplayTime(0);
     tabPlayOffsetRef.current = 0;
+    if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
     try {
       const arrayBuffer = await file.arrayBuffer();
       const audioContext = new AudioContext();
@@ -1054,13 +995,17 @@ function App() {
       const right = audioBuffer.numberOfChannels > 1
         ? audioBuffer.getChannelData(1)
         : left;
+      const monoFull = new Float32Array(left.length);
+      for (let i = 0; i < left.length; i++) monoFull[i] = (left[i] + right[i]) / 2;
       guitarStemRef.current = {
         left: new Float32Array(left),
         right: new Float32Array(right),
         sampleRate: audioBuffer.sampleRate,
       };
+      tabSliceRef.current = { mono: monoFull, sampleRate: audioBuffer.sampleRate, duration: audioBuffer.duration };
       setGuitarFileLabel(file.name);
       setGuitarDuration(audioBuffer.duration);
+      setTabDuration(audioBuffer.duration);
     } catch (err) {
       setTabError(`Could not decode audio file: ${err.message}`);
     }
@@ -1073,7 +1018,7 @@ function App() {
     setTabProcessing(true);
     setTabProgress(0);
     setTabError('');
-    setTabText('');
+    clearTab();
 
     try {
       const { BasicPitch, outputToNotesPoly, noteFramesToTime } = await import('@spotify/basic-pitch');
@@ -1090,7 +1035,6 @@ function App() {
         mono[i - startSample] = (left[i] + right[i]) / 2;
       }
 
-      // Store slice for the tab player
       stopTabNodes();
       tabSliceRef.current = { mono: new Float32Array(mono), sampleRate, duration: mono.length / sampleRate };
       tabAudioBufRef.current = null;
@@ -1130,23 +1074,31 @@ function App() {
         (progress) => setTabProgress(progress),
       );
 
-      const MIN_NOTE_DURATION = 0.1;
+      const MIN_NOTE_DURATION = 0.05;
       const notes = outputToNotesPoly(
         frames, onsets,
-        0.5,   // onset threshold (was 0.65)
-        0.3,   // frame threshold (was 0.5)
+        0.4,
+        0.2,
         MIN_NOTE_DURATION,
         true,
         1320,
         80,
       );
       const notesTimed = noteFramesToTime(notes);
-      const filtered = notesTimed.filter((n) => n.amplitude >= 0.35);
+      const filtered = notesTimed.filter((n) => n.amplitude >= 0.25);
 
       if (filtered.length === 0) {
         setTabError('No guitar notes detected above confidence threshold.');
       } else {
-        setTabText(renderAsciiTab(filtered));
+        const { bpm, stringCount } = useTabStore.getState();
+        const { tab, techniques, leadTab, leadTechniques, rhythmTab, rhythmTechniques, totalBeats } =
+          notesToTab(filtered, bpm, stringCount);
+        useTabStore.getState().loadTab(
+          tab, techniques,
+          leadTab, leadTechniques,
+          rhythmTab, rhythmTechniques,
+          totalBeats,
+        );
       }
     } catch (err) {
       console.error('Tab detection error:', err);
@@ -1172,7 +1124,6 @@ function App() {
       }
     }
 
-    // Normalize if clipping
     let peak = 0;
     for (let i = 0; i < length; i++) {
       peak = Math.max(peak, Math.abs(mixed.left[i]), Math.abs(mixed.right[i]));
@@ -1193,394 +1144,458 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
-  const activeStemLabels = [...activeStemKeys]
-    .map((k) => instrumentTypes.find((i) => i.key === k)?.label)
-    .filter(Boolean)
-    .join(' + ');
+  const stemPlayerPct = stemDurationRef.current > 0 ? (displayTime / stemDurationRef.current) * 100 : 0;
 
   return (
     <div className="app-shell">
-      <header>
-        <h1>KAPPA</h1>
-        <p>Split any song into stems, play them back, and generate guitar & drum tabs — all offline in your browser.</p>
-      </header>
 
-      <section className="card">
-        <h2>Audio source</h2>
-        {!audioName ? (
-          <label className="upload-zone">
-            <div className="upload-icon">🎵</div>
-            <div className="upload-text">Tap to load audio</div>
-            <div className="upload-hint">MP3, WAV, FLAC…</div>
-            <input type="file" accept="audio/*" onChange={handleMainFile} />
+      {/* ── TOP BAR ── */}
+      <div className="top-bar">
+        <span className="top-bar-logo">KAPPA</span>
+
+        {audioName ? (
+          <label className="top-bar-file" title="Load a different file">
+            <div className="tbf-dot" />
+            <span className="tbf-name">{audioName}</span>
+            <input type="file" accept="audio/*" onChange={handleMainFile} style={{ display: 'none' }} />
           </label>
         ) : (
-          <div className="file-loaded">
-            <div className="file-name">📄 {audioName}</div>
-            <audio controls src={audioUrl} />
-          </div>
+          <label className="top-bar-file">
+            <span className="tbf-prompt">🎵 Load audio…</span>
+            <input type="file" accept="audio/*" onChange={handleMainFile} style={{ display: 'none' }} />
+          </label>
         )}
 
-        {audioName && (
-          <button type="button" onClick={handleSeparate} disabled={!audioFile || processing}>
-            {processing ? 'Separating…' : 'Separate Stems'}
-          </button>
-        )}
-
-        {(processing || isSeparated) && (
-          <div className="progress-row">
-            <div className="progress-bar-bg">
-              <div className={`progress-bar-fill${processing ? ' active' : ''}`} style={{ width: `${Math.round(progress * 100)}%` }} />
+        {isSeparated && (
+          <div className="top-bar-player">
+            <span className="tbp-time">{formatTime(displayTime)}</span>
+            <div className="tbp-scrub">
+              <div className="tbp-fill" style={{ width: `${stemPlayerPct}%` }} />
+              <input
+                ref={scrubberRef}
+                type="range"
+                className="tbp-input"
+                min="0"
+                max={stemDurationRef.current || 1}
+                step="0.1"
+                defaultValue="0"
+                onChange={handleScrub}
+              />
+              <div className="tbp-thumb" style={{ left: `${stemPlayerPct}%` }} />
             </div>
-            <span>{Math.round(progress * 100)}%</span>
+            <span className="tbp-time">{formatTime(stemDurationRef.current)}</span>
           </div>
         )}
-      </section>
 
-      {processing && (
-        <section className="card">
-          <div className="waveform-animation">
-            {Array.from({ length: 14 }, (_, i) => (
-              <span key={i} style={{ animationDelay: `${((i * 0.09) % 0.45).toFixed(2)}s` }} />
-            ))}
-          </div>
-          <p className="processing-status">{fromCache ? 'Loading from cache…' : 'Separating stems…'}</p>
-          {instrumentTypes.map(({ key, label, emoji }) => (
-            <div key={key} className="skeleton-card">
-              <div className="skeleton-icon" />
-              <div className="skeleton-lines">
-                <div className="skeleton-line" />
-                <div className="skeleton-line short" />
-              </div>
-            </div>
-          ))}
-          <p className="hint" style={{ textAlign: 'center', marginTop: 8 }}>First run downloads ~172 MB model.</p>
-        </section>
-      )}
-
-      {isSeparated && (
-        <section className="card">
-          <h2>Stem Player</h2>
-          <p>Toggle stems to include in playback, then press Play. Download individual stems below each chip.</p>
-
-          <div className="stem-chips">
-            {instrumentTypes.map(({ key, label, emoji }) => (
-              <div key={key} className="stem-chip-item">
-                <button
-                  type="button"
-                  className={`stem-chip${activeStemKeys.has(key) ? ' active' : ''}`}
-                  onClick={() => toggleStem(key)}
-                >
-                  <span className="stem-chip-label">
-                    <span className="stem-chip-emoji">{emoji}</span>
-                    {label}
-                  </span>
-                  <span className="stem-toggle-track">
-                    <span className="stem-toggle-dot" />
-                  </span>
-                </button>
-                <a
-                  href={stems[key]}
-                  download={`${audioName.replace(/\.[^.]+$/, '')}-${key}.wav`}
-                  className="stem-download"
-                  title={`Download ${label}`}
-                >
-                  ⬇
-                </a>
-              </div>
-            ))}
-          </div>
-
-          <div className="stem-scrubber-row">
-            <span className="stem-time">{formatTime(displayTime)}</span>
-            <input
-              ref={scrubberRef}
-              type="range"
-              className="stem-scrubber"
-              min="0"
-              max={stemDurationRef.current || 1}
-              step="0.1"
-              defaultValue="0"
-              onChange={handleScrub}
-            />
-            <span className="stem-time stem-time-right">{formatTime(stemDurationRef.current)}</span>
-          </div>
-
-          <div className="stem-playback-controls">
-            {isPlaying ? (
-              <button type="button" onClick={pausePlayback}>⏸ Pause</button>
+        <div className="top-bar-controls">
+          {isSeparated && (
+            isPlaying ? (
+              <button className="tb-btn primary" onClick={pausePlayback}>⏸ Pause</button>
             ) : (
-              <button
-                type="button"
-                onClick={() => startPlayback()}
-                disabled={activeStemKeys.size === 0}
-              >
-                ▶ Play
-              </button>
-            )}
-            <button type="button" className="btn-stop" onClick={handleStop}>⏹ Stop</button>
-            <button
-              type="button"
-              onClick={handleDownloadMix}
-              disabled={activeStemKeys.size === 0}
-              title="Download active stems mixed into one file"
-            >
-              ⬇
-            </button>
-            {activeStemKeys.size > 0 ? (
-              <span className="hint">{activeStemLabels}</span>
-            ) : (
-              <span className="hint">Select at least one stem to play.</span>
-            )}
-          </div>
-        </section>
-      )}
-
-      <section className="card">
-        <div className="tab-nav">
-          <button
-            type="button"
-            className={`tab-nav-btn${activeTabSection === 'guitar' ? ' active' : ''}`}
-            onClick={() => setActiveTabSection('guitar')}
-          >
-            🎸 Guitar Tab
-          </button>
-          <button
-            type="button"
-            className={`tab-nav-btn${activeTabSection === 'drums' ? ' active' : ''}`}
-            onClick={() => setActiveTabSection('drums')}
-          >
-            🥁 Drum Tab
-          </button>
+              <button className="tb-btn primary" onClick={() => startPlayback()} disabled={activeStemKeys.size === 0}>▶ Play</button>
+            )
+          )}
+          {isSeparated && (
+            <button className="tb-btn" onClick={handleStop}>⏹</button>
+          )}
+          {isSeparated && activeStemKeys.size > 0 && (
+            <button className="tb-btn" onClick={handleDownloadMix} title="Download active stems as mix">⬇ Mix</button>
+          )}
+          {audioName && (
+            <button className="tb-btn danger" onClick={handleReset}>✕ Reset</button>
+          )}
         </div>
+      </div>
 
-        {activeTabSection === 'guitar' && <>
-        <p style={{ marginBottom: 14 }}>Detect notes and generate an ASCII tab from a guitar stem.</p>
-
-        <p style={{ marginBottom: 10 }}>Upload a pre-separated guitar file</p>
-        <label className="guitar-zone">
-          <div className="guitar-zone-icon">🎸</div>
-          {guitarFileLabel ? (
-            <div className="guitar-zone-filename">{guitarFileLabel}</div>
-          ) : (
-            <>
-              <div className="guitar-zone-text">Tap to choose</div>
-              <div className="guitar-zone-hint">MP3 · WAV · FLAC</div>
-            </>
-          )}
-          <input type="file" accept="audio/*" onChange={handleGuitarFile} />
-        </label>
-
-        {!guitarFileLabel && guitarStemRef.current && (
-          <p className="hint">Using guitar stem from separation</p>
-        )}
-
-        {guitarDuration > 0 && (
-          <div
-            className="range-selector"
-            ref={rangeRef}
-            onPointerDown={handleRangePointerDown}
-            onPointerMove={handleRangePointerMove}
-            onPointerUp={handleRangePointerUp}
-          >
-            <div className="range-track">
-              <div
-                className="range-fill"
-                style={{
-                  left: `${(tabStartSec / guitarDuration) * 100}%`,
-                  width: `${((tabEndSec - tabStartSec) / guitarDuration) * 100}%`,
-                }}
-              />
-            </div>
-            <div
-              className="range-handle"
-              data-handle="start"
-              style={{ left: `${(tabStartSec / guitarDuration) * 100}%` }}
-            />
-            <div
-              className="range-handle"
-              data-handle="end"
-              style={{ left: `${(tabEndSec / guitarDuration) * 100}%` }}
-            />
-            <div className="range-times">
-              <span>{formatTime(tabStartSec)}</span>
-              <span>{formatTime(tabEndSec)}</span>
-            </div>
-          </div>
-        )}
-
+      {/* ── TAB NAV ── */}
+      <nav className="kappa-nav">
         <button
-          type="button"
-          onClick={detectTab}
-          disabled={tabProcessing || !guitarStemRef.current}
-        >
-          {tabProcessing ? 'Detecting...' : 'Detect Guitar Tab'}
-        </button>
-
-        {tabProcessing && (
-          <div className="progress-row">
-            <div className="progress-bar-bg">
-              <div
-                className={`progress-bar-fill${tabProcessing ? ' active' : ''}`}
-                style={{ width: `${Math.round(tabProgress * 100)}%` }}
-              />
-            </div>
-            <span>{Math.round(tabProgress * 100)}%</span>
-          </div>
-        )}
-
-        {tabError && <p className="hint" style={{ color: '#e53e3e' }}>{tabError}</p>}
-
-        {tabDuration > 0 && (
-          <div className="tab-player">
-            <div className="tab-player-title">Guitar segment</div>
-            <div className="stem-scrubber-row">
-              <span className="stem-time">{formatTime(tabDisplayTime)}</span>
-              <input
-                ref={tabScrubberRef}
-                type="range"
-                className="stem-scrubber"
-                min="0"
-                max={tabDuration || 1}
-                step="0.1"
-                defaultValue="0"
-                onChange={handleTabScrub}
-              />
-              <span className="stem-time stem-time-right">{formatTime(tabDuration)}</span>
-            </div>
-            <div className="stem-playback-controls">
-              {tabIsPlaying ? (
-                <button type="button" onClick={pauseTabPlayback}>⏸</button>
-              ) : (
-                <button type="button" onClick={() => startTabPlayback()}>▶</button>
-              )}
-              <button type="button" className="btn-stop" onClick={handleTabStop}>⏹</button>
-            </div>
-          </div>
-        )}
-
-        {tabText && (
-          <div className="tab-display">
-            <button
-              type="button"
-              className="tab-copy-btn"
-              onClick={() => navigator.clipboard.writeText(tabText)}
-            >
-              Copy Tab
-            </button>
-            <pre className="tab-pre">{tabText}</pre>
-          </div>
-        )}
-        </>}
-
-        {activeTabSection === 'drums' && <>
-        <p style={{ marginBottom: 14 }}>Detect bass drum, snare, and hi-hat hits from a drum stem.</p>
-
-        <p style={{ marginBottom: 10 }}>Upload a pre-separated drum file</p>
-        <label className="guitar-zone">
-          <div className="guitar-zone-icon">🥁</div>
-          {drumFileLabel ? (
-            <div className="guitar-zone-filename">{drumFileLabel}</div>
-          ) : (
-            <>
-              <div className="guitar-zone-text">Tap to choose</div>
-              <div className="guitar-zone-hint">MP3 · WAV · FLAC</div>
-            </>
-          )}
-          <input type="file" accept="audio/*" onChange={handleDrumFile} />
-        </label>
-
-        {!drumFileLabel && drumStemRef.current && (
-          <p className="hint">Using drum stem from separation</p>
-        )}
-
-        {drumDuration > 0 && (
-          <div
-            className="range-selector"
-            ref={drumRangeRef}
-            onPointerDown={handleDrumRangePointerDown}
-            onPointerMove={handleDrumRangePointerMove}
-            onPointerUp={handleDrumRangePointerUp}
-          >
-            <div className="range-track">
-              <div
-                className="range-fill"
-                style={{
-                  left: `${(drumTabStartSec / drumDuration) * 100}%`,
-                  width: `${((drumTabEndSec - drumTabStartSec) / drumDuration) * 100}%`,
-                }}
-              />
-            </div>
-            <div className="range-handle" data-handle="start" style={{ left: `${(drumTabStartSec / drumDuration) * 100}%` }} />
-            <div className="range-handle" data-handle="end" style={{ left: `${(drumTabEndSec / drumDuration) * 100}%` }} />
-            <div className="range-times">
-              <span>{formatTime(drumTabStartSec)}</span>
-              <span>{formatTime(drumTabEndSec)}</span>
-            </div>
-          </div>
-        )}
-
+          className={`kappa-nav-btn${activeTabSection === 'stems' ? ' active' : ''}`}
+          onClick={() => setActiveTabSection('stems')}
+        >⚡ Stems</button>
         <button
-          type="button"
-          onClick={detectDrumTab}
-          disabled={drumTabProcessing || !drumStemRef.current}
-        >
-          {drumTabProcessing ? 'Detecting…' : 'Detect Drum Tab'}
-        </button>
+          className={`kappa-nav-btn${activeTabSection === 'guitar' ? ' active' : ''}`}
+          onClick={() => setActiveTabSection('guitar')}
+        >🎸 Guitar Tab</button>
+        <button
+          className={`kappa-nav-btn${activeTabSection === 'chords' ? ' active' : ''}`}
+          onClick={() => setActiveTabSection('chords')}
+        >🎵 Chords</button>
+      </nav>
 
-        {drumTabProcessing && (
-          <div className="progress-row">
-            <div className="progress-bar-bg">
-              <div className="progress-bar-fill active" style={{ width: `${Math.round(drumTabProgress * 100)}%` }} />
-            </div>
-            <span>{Math.round(drumTabProgress * 100)}%</span>
-          </div>
-        )}
-
-        {drumTabError && <p className="hint" style={{ color: '#e53e3e' }}>{drumTabError}</p>}
-
-        {drumTabDuration > 0 && (
-          <div className="tab-player">
-            <div className="tab-player-title">Drum segment</div>
-            <div className="stem-scrubber-row">
-              <span className="stem-time">{formatTime(drumTabDisplayTime)}</span>
-              <input
-                ref={drumTabScrubberRef}
-                type="range"
-                className="stem-scrubber"
-                min="0"
-                max={drumTabDuration || 1}
-                step="0.1"
-                defaultValue="0"
-                onChange={handleDrumTabScrub}
-              />
-              <span className="stem-time stem-time-right">{formatTime(drumTabDuration)}</span>
-            </div>
-            <div className="stem-playback-controls">
-              {drumTabIsPlaying ? (
-                <button type="button" onClick={pauseDrumTabPlayback}>⏸</button>
+      {/* ══ STEMS TAB ══ */}
+      {activeTabSection === 'stems' && (
+        <div className="workspace">
+          <aside className="controls-panel">
+            <div>
+              <div className="panel-label">Audio Source</div>
+              {!audioName ? (
+                <label className="upload-zone">
+                  <div className="uz-icon">🎵</div>
+                  <div className="uz-text">Tap to load audio</div>
+                  <div className="uz-hint">MP3 · WAV · FLAC · AIFF</div>
+                  <input type="file" accept="audio/*" onChange={handleMainFile} />
+                </label>
               ) : (
-                <button type="button" onClick={() => startDrumTabPlayback()}>▶</button>
+                <div className="file-pill">
+                  <span className="fp-icon">📄</span>
+                  <span className="fp-name">{audioName}</span>
+                </div>
               )}
-              <button type="button" className="btn-stop" onClick={handleDrumTabStop}>⏹</button>
+            </div>
+
+            <button className="btn-action" onClick={handleSeparate} disabled={!audioFile || processing}>
+              {processing ? 'Separating…' : 'Separate Stems'}
+            </button>
+
+            {(processing || isSeparated) && (
+              <div className="progress-row">
+                <div className="progress-bar-bg">
+                  <div className={`progress-bar-fill${processing ? ' active' : ''}`} style={{ width: `${Math.round(progress * 100)}%` }} />
+                </div>
+                <span>{Math.round(progress * 100)}%</span>
+              </div>
+            )}
+            {fromCache && !processing && <p className="hint">✓ Loaded from cache</p>}
+
+            {isSeparated && (
+              <div>
+                <div className="panel-label">Active Stems</div>
+                <div className="stem-chips">
+                  {instrumentTypes.map(({ key, label, emoji }) => (
+                    <div key={key} className="stem-chip-item">
+                      <button
+                        type="button"
+                        className={`stem-chip${activeStemKeys.has(key) ? ' active' : ''}`}
+                        onClick={() => toggleStem(key)}
+                      >
+                        <span className="stem-chip-label">
+                          <span className="stem-chip-emoji">{emoji}</span>
+                          {label}
+                        </span>
+                        <span className="stem-toggle-track">
+                          <span className="stem-toggle-dot" />
+                        </span>
+                      </button>
+                      <a
+                        href={stems[key]}
+                        download={`${audioName.replace(/\.[^.]+$/, '')}-${key}.wav`}
+                        className="stem-download"
+                        title={`Download ${label}`}
+                      >⬇</a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </aside>
+
+          <div className="main-area">
+            {processing && (
+              <div className="processing-panel">
+                <div className="waveform-animation">
+                  {Array.from({ length: 14 }, (_, i) => (
+                    <span key={i} style={{ animationDelay: `${((i * 0.09) % 0.45).toFixed(2)}s` }} />
+                  ))}
+                </div>
+                <p className="processing-status">{fromCache ? 'Loading from cache…' : 'Separating stems…'}</p>
+                {instrumentTypes.map(({ key }) => (
+                  <div key={key} className="skeleton-card">
+                    <div className="skeleton-icon" />
+                    <div className="skeleton-lines">
+                      <div className="skeleton-line" />
+                      <div className="skeleton-line short" />
+                    </div>
+                  </div>
+                ))}
+                <p className="hint" style={{ textAlign: 'center' }}>First run downloads ~172 MB model.</p>
+              </div>
+            )}
+            {isSeparated && !processing && (
+              <>
+                <div className="main-title">Stem Previews</div>
+                <div className="stem-wave-grid">
+                  {instrumentTypes.map(({ key, label, emoji }) => (
+                    <div key={key} className="stem-wave-card" style={{ opacity: activeStemKeys.has(key) ? 1 : 0.4 }}>
+                      <div className="stem-wave-label">{emoji} {label}</div>
+                      <audio controls src={stems[key]} />
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {!audioName && !processing && (
+              <p className="hint" style={{ marginTop: 40, textAlign: 'center' }}>
+                Load an audio file from the left panel, then click Separate Stems.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ══ GUITAR TAB ══ */}
+      {activeTabSection === 'guitar' && (
+        <div className="workspace">
+          <aside className="controls-panel">
+            <div>
+              <div className="panel-label">Guitar Audio</div>
+              {guitarDuration > 0 ? (
+                <div className="file-pill">
+                  <span className="fp-icon">🎸</span>
+                  <span className="fp-name">
+                    {isSeparated ? `Guitar stem · ${audioName}` : audioName}
+                  </span>
+                </div>
+              ) : (
+                <p className="hint" style={{ textAlign: 'center', padding: '10px 0' }}>
+                  Load audio using the ♪ button in the top bar
+                </p>
+              )}
+            </div>
+
+            {guitarDuration > 0 && (
+              <div>
+                <div className="panel-label">Range</div>
+                <div
+                  className="range-selector"
+                  ref={rangeRef}
+                  onPointerDown={handleRangePointerDown}
+                  onPointerMove={handleRangePointerMove}
+                  onPointerUp={handleRangePointerUp}
+                >
+                  <div className="range-track">
+                    <div className="range-fill" style={{ left: `${(tabStartSec / guitarDuration) * 100}%`, width: `${((tabEndSec - tabStartSec) / guitarDuration) * 100}%` }} />
+                  </div>
+                  <div className="range-handle" data-handle="start" style={{ left: `${(tabStartSec / guitarDuration) * 100}%` }} />
+                  <div className="range-handle" data-handle="end" style={{ left: `${(tabEndSec / guitarDuration) * 100}%` }} />
+                  <div className="range-times">
+                    <span>{formatTime(tabStartSec)}</span>
+                    <span>{formatTime(tabEndSec)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div>
+              <div className="panel-label">Strings</div>
+              <StringSelector />
+            </div>
+
+            <button className="btn-action" onClick={detectTab} disabled={tabProcessing || !guitarStemRef.current}>
+              {tabProcessing ? 'Detecting…' : 'Detect Guitar Tab'}
+            </button>
+
+            {tabProcessing && (
+              <div className="progress-row">
+                <div className="progress-bar-bg">
+                  <div className={`progress-bar-fill${tabProcessing ? ' active' : ''}`} style={{ width: `${Math.round(tabProgress * 100)}%` }} />
+                </div>
+                <span>{Math.round(tabProgress * 100)}%</span>
+              </div>
+            )}
+
+            {tabError && <p className="hint" style={{ color: 'var(--danger)' }}>{tabError}</p>}
+
+            <div>
+              <div className="panel-label">Playback</div>
+              {guitarDuration > 0 && (
+                <div className="stem-scrubber-row" style={{ marginBottom: 8 }}>
+                  <span className="stem-time">{formatTime(tabDisplayTime)}</span>
+                  <input
+                    ref={tabScrubberRef}
+                    type="range"
+                    className="stem-scrubber"
+                    min="0"
+                    max={tabDuration || 1}
+                    step="0.1"
+                    defaultValue="0"
+                    onChange={handleTabScrub}
+                  />
+                  <span className="stem-time">{formatTime(tabDuration)}</span>
+                </div>
+              )}
+              <TransportBar
+                onPlay={() => startTabPlayback()}
+                onPause={pauseTabPlayback}
+                onStop={handleTabStop}
+                isPlayingAudio={tabIsPlaying}
+                hasAudio={guitarDuration > 0}
+              />
+            </div>
+          </aside>
+
+          <div className="main-area">
+            <TabTimeline onSeek={tabSeekTo} />
+            <div className="tab-view-toggle">
+              <button className={`tvt-btn${tabView === 'lead'   ? ' active' : ''}`} onClick={() => setTabView('lead')}>🎸 Lead</button>
+              <button className={`tvt-btn${tabView === 'rhythm' ? ' active' : ''}`} onClick={() => setTabView('rhythm')}>🎵 Rhythm</button>
+              <button className={`tvt-btn${tabView === 'both'   ? ' active' : ''}`} onClick={() => setTabView('both')}>Both</button>
+            </div>
+            <div className="lead-rhythm-split">
+              {(tabView === 'lead' || tabView === 'both') && (
+                <div>
+                  {tabView === 'both' && <div className="tab-section-header">🎸 Lead</div>}
+                  {!leadIsEmpty && (
+                    <TabGrid
+                      source="lead"
+                      lyricsLines={lyricsLines}
+                      tabStartSec={tabStartSec}
+                      lyricsCurrentTime={tabIsPlaying ? tabDisplayTime + tabStartSec : isPlaying ? displayTime : null}
+                    />
+                  )}
+                </div>
+              )}
+              {tabView === 'both' && !leadIsEmpty && !rhythmIsEmpty && (
+                <div className="tab-section-divider" />
+              )}
+              {(tabView === 'rhythm' || tabView === 'both') && (
+                <div>
+                  {tabView === 'both' && <div className="tab-section-header">🎵 Rhythm</div>}
+                  {!rhythmIsEmpty && (
+                    <TabGrid
+                      source="rhythm"
+                      lyricsLines={lyricsLines}
+                      tabStartSec={tabStartSec}
+                      lyricsCurrentTime={tabIsPlaying ? tabDisplayTime + tabStartSec : isPlaying ? displayTime : null}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+            <LyricsPanel
+              query={lyricsQuery}
+              onQueryChange={setLyricsQuery}
+              onSearch={searchLyrics}
+              searching={lyricsSearching}
+              detecting={lyricsDetecting}
+              status={lyricsStatus}
+              error={lyricsError}
+              source={lyricsSource}
+              onDetect={detectLyricsFromAudio}
+              hasAudio={!!(stemsDataRef.current?.vocals || audioFile || guitarStemRef.current)}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* ══ CHORDS TAB ══ */}
+      {activeTabSection === 'chords' && (() => {
+        const effectiveDur = chordDuration > 0 ? chordDuration : guitarDuration;
+        const hasAudio = !!(chordStemRef.current || guitarStemRef.current);
+        return (
+          <div className="workspace">
+            <aside className="controls-panel">
+              <div>
+                <div className="panel-label">Audio</div>
+                {(guitarDuration > 0 || chordDuration > 0) ? (
+                  <div className="file-pill">
+                    <span className="fp-icon">🎵</span>
+                    <span className="fp-name">
+                      {isSeparated ? `Guitar stem · ${audioName}` : audioName}
+                    </span>
+                  </div>
+                ) : (
+                  <p className="hint" style={{ textAlign: 'center', padding: '10px 0' }}>
+                    Load audio using the ♪ button in the top bar
+                  </p>
+                )}
+              </div>
+
+              {effectiveDur > 0 && (
+                <div>
+                  <div className="panel-label">Range</div>
+                  <div
+                    className="range-selector"
+                    ref={chordRangeRef}
+                    onPointerDown={handleChordRangePointerDown}
+                    onPointerMove={handleChordRangePointerMove}
+                    onPointerUp={handleChordRangePointerUp}
+                  >
+                    <div className="range-track">
+                      <div className="range-fill" style={{ left: `${(chordStartSec / effectiveDur) * 100}%`, width: `${((chordEndSec - chordStartSec) / effectiveDur) * 100}%` }} />
+                    </div>
+                    <div className="range-handle" data-handle="start" style={{ left: `${(chordStartSec / effectiveDur) * 100}%` }} />
+                    <div className="range-handle" data-handle="end" style={{ left: `${(chordEndSec / effectiveDur) * 100}%` }} />
+                    <div className="range-times">
+                      <span>{formatTime(chordStartSec)}</span>
+                      <span>{formatTime(chordEndSec)}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <button className="btn-action" onClick={detectChordsHandler} disabled={chordProcessing || !hasAudio}>
+                {chordProcessing ? 'Detecting…' : 'Detect Chords'}
+              </button>
+
+              {chordProcessing && (
+                <div className="progress-row">
+                  <div className="progress-bar-bg">
+                    <div className="progress-bar-fill active" style={{ width: `${Math.round(chordProgress * 100)}%` }} />
+                  </div>
+                  <span>{Math.round(chordProgress * 100)}%</span>
+                </div>
+              )}
+
+              {chordError && <p className="hint" style={{ color: 'var(--danger)' }}>{chordError}</p>}
+            </aside>
+
+            <div className="main-area">
+              <ChordSheet
+                segments={chordResults}
+                lyricsLines={lyricsLines}
+                chordStartSec={chordStartSec}
+                lyricsCurrentTime={tabIsPlaying ? tabDisplayTime + tabStartSec : isPlaying ? displayTime : null}
+              />
+              <LyricsPanel
+                query={lyricsQuery}
+                onQueryChange={setLyricsQuery}
+                onSearch={searchLyrics}
+                searching={lyricsSearching}
+                detecting={lyricsDetecting}
+                status={lyricsStatus}
+                error={lyricsError}
+                source={lyricsSource}
+                onDetect={detectLyricsFromAudio}
+                hasAudio={!!(stemsDataRef.current?.vocals || audioFile || guitarStemRef.current)}
+              />
             </div>
           </div>
-        )}
+        );
+      })()}
 
-        {drumTabText && (
-          <div className="tab-display">
-            <button
-              type="button"
-              className="tab-copy-btn"
-              onClick={() => navigator.clipboard.writeText(drumTabText)}
-            >
-              Copy Tab
-            </button>
-            <pre className="tab-pre">{drumTabText}</pre>
-          </div>
-        )}
-        </>}
-      </section>
+    </div>
+  );
+}
+
+function LyricsPanel({ query, onQueryChange, onSearch, searching, detecting, status, error, source, onDetect, hasAudio }) {
+  return (
+    <div className="lyrics-panel">
+      <div className="lyrics-panel-title">Lyrics</div>
+      <div className="lyrics-search-row">
+        <input
+          className="lyrics-search-input"
+          type="text"
+          placeholder="Artist – Song title"
+          value={query}
+          onChange={e => onQueryChange(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && onSearch()}
+        />
+        <button type="button" onClick={onSearch} disabled={searching || !query.trim()}>
+          {searching ? 'Searching…' : 'Search'}
+        </button>
+      </div>
+      {source && <p className="lyrics-source">✓ {source}</p>}
+      {status && <p className="lyrics-status">{status}</p>}
+      {error && <p className="hint" style={{ color: 'var(--danger)', marginTop: 6 }}>{error}</p>}
+      <div className="lyrics-audio-row">
+        <button type="button" onClick={onDetect} disabled={detecting || !hasAudio}>
+          {detecting ? 'Detecting…' : 'Detect from Audio'}
+        </button>
+        <span className="lyrics-audio-hint">
+          {hasAudio ? 'Uses Whisper AI — first run downloads ~80 MB model' : 'Load audio first'}
+        </span>
+      </div>
     </div>
   );
 }
