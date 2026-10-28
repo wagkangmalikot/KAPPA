@@ -9,8 +9,8 @@
   --chrome:         #1a1a2e;
   --chrome-border:  #2a2a42;
   --chrome-text:    #c0c8e0;
-  --chrome-muted:   #6070a0;
-  --chrome-dim:     #3a4060;
+  --chrome-muted:   #8a95c0;  /* 5.8:1 on --chrome */
+  --chrome-dim:     #3a4060;  /* borders and dots only — too faint for text */
 
   /* Light content areas */
   --bg:             #f0f3fa;
@@ -29,7 +29,7 @@
   /* Text (on light backgrounds) */
   --text:           #2d3748;
   --text-muted:     #5a6a8a;
-  --text-dim:       #9aa0b8;
+  --text-dim:       #646c8a;  /* 4.7:1 on --bg (WCAG AA) */
 
   /* Status */
   --danger:         #e05555;
@@ -56,6 +56,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -111,7 +112,7 @@ body {
 }
 .top-bar-file .tbf-prompt {
   font-size: 11px;
-  color: var(--chrome-dim);
+  color: var(--chrome-muted);
 }
 
 .top-bar-player {
@@ -128,7 +129,7 @@ body {
 }
 .top-bar-player .tbp-time {
   font-size: 10px;
-  color: var(--chrome-dim);
+  color: var(--chrome-muted);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
@@ -212,7 +213,7 @@ body {
   padding: 6px 18px;
   font-size: 12px;
   font-weight: 500;
-  color: var(--chrome-dim);
+  color: var(--chrome-muted);
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
@@ -221,7 +222,7 @@ body {
   white-space: nowrap;
   margin-bottom: -1px;
 }
-.kappa-nav-btn:hover { color: var(--chrome-muted); }
+.kappa-nav-btn:hover { color: var(--chrome-text); }
 .kappa-nav-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 
 /* ── WORKSPACE ── */
@@ -684,6 +685,7 @@ body {
   font-size: 13px;
   line-height: 1.8;
   box-shadow: 0 1px 3px #0001;
+  overflow-x: auto;
 }
 .ug-tab-row {
   display: flex;
@@ -793,6 +795,7 @@ body {
   gap: 8px;
   max-height: 60vh;
   overflow-y: auto;
+  overflow-x: auto;
 }
 .ug-chord-block {
   background: var(--bg-card);
@@ -1012,3 +1015,112 @@ audio {
 .controls-panel::-webkit-scrollbar-track { background: var(--bg-elevated); }
 .main-area::-webkit-scrollbar-thumb,
 .controls-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ════════════════════════════
+   RESPONSIVE
+   ════════════════════════════ */
+
+/* Tablet — slimmer side panel */
+@media (max-width: 1024px) {
+  :root { --panel-w: 240px; }
+  .main-area { padding: 16px 18px; }
+}
+
+/* Mobile — stack panel above content, wrap top bar */
+@media (max-width: 768px) {
+  /* Top bar: logo + file + controls on row 1, scrubber on row 2 */
+  .top-bar {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px;
+    padding-top: max(8px, env(safe-area-inset-top));
+  }
+  .top-bar-file { flex: 1; min-width: 0; }
+  .top-bar-file .tbf-name { max-width: none; }
+  .top-bar-player {
+    order: 10;
+    flex-basis: 100%;
+    padding: 8px 10px;
+  }
+  .top-bar-controls { margin-left: auto; }
+  .tb-btn { padding: 7px 10px; font-size: 12px; }
+
+  /* Nav: equal-width tabs, scroll if they don't fit */
+  .kappa-nav {
+    padding: 0 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .kappa-nav::-webkit-scrollbar { display: none; }
+  .kappa-nav-btn { flex: 1; padding: 8px 10px; font-size: 13px; }
+
+  /* Workspace scrolls as one column under the fixed top bar */
+  .workspace {
+    flex-direction: column;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+  .controls-panel {
+    width: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    overflow: visible;
+    padding: 14px 12px;
+    flex-shrink: 0;
+  }
+  .main-area {
+    flex: none;
+    overflow: visible;
+    padding: 14px 12px;
+    padding-bottom: max(14px, env(safe-area-inset-bottom));
+  }
+
+  /* Bigger touch targets */
+  .btn-action { padding: 12px 14px; font-size: 13px; }
+  .stem-chip { padding: 10px 12px; font-size: 12px; }
+  .stem-download { padding: 8px; font-size: 16px; }
+  .transport-btn,
+  .stem-playback-controls button { padding: 8px 14px; font-size: 13px; }
+  .tvt-btn { flex: 1; padding: 8px 10px; }
+  .range-handle { width: 22px; height: 22px; }
+  .range-selector { padding: 14px 0 6px; }
+  .tab-timeline-track { height: 20px; border-radius: 10px; }
+
+  /* 16px inputs stop iOS from zooming on focus */
+  .lyrics-search-input,
+  .transport-bpm-input,
+  .string-selector-select,
+  .ug-lyrics-input { font-size: 16px; }
+  .lyrics-search-input { padding: 8px 10px; }
+  .ug-lyrics-input { min-width: 100%; }
+
+  /* Content */
+  .stem-wave-grid { grid-template-columns: 1fr; }
+  .ug-tab-system { padding: 8px 10px; font-size: 12px; }
+  .ug-tab-scroll,
+  .ug-chord-scroll { max-height: none; }
+  .tab-timeline-counter { min-width: 0; }
+
+  /* Nothing under 11px on phones */
+  .panel-label,
+  .stem-time,
+  .range-times,
+  .progress-row > span,
+  .lyrics-audio-hint,
+  .tab-timeline-counter,
+  .top-bar-player .tbp-time { font-size: 11px; }
+  .hint,
+  .uz-text,
+  .ug-chord-count,
+  .lyrics-source,
+  .lyrics-status { font-size: 12px; }
+  .string-selector-dialog-box { margin: 0 16px; }
+}
+
+/* Small phones — tighter top bar */
+@media (max-width: 400px) {
+  .top-bar-logo { font-size: 12px; letter-spacing: 2px; }
+  .top-bar-controls { gap: 4px; }
+  .tb-btn { padding: 7px 8px; }
+}

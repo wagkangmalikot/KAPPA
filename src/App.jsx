@@ -7,6 +7,8 @@ import { TransportBar } from './components/TransportBar';
 import { TabTimeline } from './components/TabTimeline';
 import { TabGrid } from './components/TabGrid';
 import { ChordSheet } from './components/ChordSheet';
+import { PentatonicTab } from './components/PentatonicTab';
+import { announcePlayback, onPlaybackStart } from './playbackBus';
 import { useTabAudio } from './hooks/useTabAudio';
 
 // ── IndexedDB stem cache ─────────────────────────────────────────
@@ -587,6 +589,7 @@ function App() {
     };
     rafRef.current = requestAnimationFrame(tick);
     setIsPlaying(true);
+    announcePlayback('stems');
   };
 
   const pausePlayback = () => {
@@ -671,6 +674,7 @@ function App() {
     };
     tabRafRef.current = requestAnimationFrame(tick);
     setTabIsPlaying(true);
+    announcePlayback('tab');
   };
 
   const pauseTabPlayback = () => {
@@ -693,6 +697,19 @@ function App() {
     tabPlayOffsetRef.current = 0;
     if (tabScrubberRef.current) tabScrubberRef.current.value = '0';
   };
+
+  // Only one player sounds at a time: pause ours when another one starts.
+  // The ref always holds this render's pause functions, null when not playing.
+  const pausersRef = useRef({});
+  pausersRef.current = {
+    stems: isPlaying ? pausePlayback : null,
+    tab: tabIsPlaying ? pauseTabPlayback : null,
+  };
+  useEffect(() => onPlaybackStart(source => {
+    Object.entries(pausersRef.current).forEach(([name, pause]) => {
+      if (name !== source && pause) pause();
+    });
+  }), []);
 
   const handleTabScrub = (e) => {
     const newTime = parseFloat(e.target.value);
@@ -1221,6 +1238,10 @@ function App() {
           className={`kappa-nav-btn${activeTabSection === 'chords' ? ' active' : ''}`}
           onClick={() => setActiveTabSection('chords')}
         >🎵 Chords</button>
+        <button
+          className={`kappa-nav-btn${activeTabSection === 'pentatonic' ? ' active' : ''}`}
+          onClick={() => setActiveTabSection('pentatonic')}
+        >🎼 Pentatonic</button>
       </nav>
 
       {/* ══ STEMS TAB ══ */}
@@ -1326,7 +1347,7 @@ function App() {
             )}
             {!audioName && !processing && (
               <p className="hint" style={{ marginTop: 40, textAlign: 'center' }}>
-                Load an audio file from the left panel, then click Separate Stems.
+                Load an audio file under Audio Source, then click Separate Stems.
               </p>
             )}
           </div>
@@ -1563,6 +1584,9 @@ function App() {
           </div>
         );
       })()}
+
+      {/* ══ PENTATONIC TAB ══ */}
+      <PentatonicTab active={activeTabSection === 'pentatonic'} />
 
     </div>
   );
