@@ -66,6 +66,7 @@ function App() {
   const [audioUrl, setAudioUrl] = useState('');
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [separationDetail, setSeparationDetail] = useState('');
   const [fromCache, setFromCache] = useState(false);
   const [stems, setStems] = useState({ guitar: '', bass: '', drums: '', vocals: '' });
   const [isSeparated, setIsSeparated] = useState(false);
@@ -302,10 +303,21 @@ function App() {
     clearTab();
   };
 
+  // One separation worker for the whole session: it keeps the 180 MB model
+  // loaded between songs. (A new worker per run reloaded the model every time
+  // and leaked the previous one.)
+  const separationWorkerRef = useRef(null);
   const initializeWorker = () => {
-    const worker = new Worker(separationWorkerUrl, { type: 'module' });
-    return worker;
+    if (!separationWorkerRef.current) {
+      separationWorkerRef.current = new Worker(separationWorkerUrl, { type: 'module' });
+    }
+    return separationWorkerRef.current;
   };
+  const discardWorker = () => {
+    separationWorkerRef.current?.terminate();
+    separationWorkerRef.current = null;
+  };
+  useEffect(() => discardWorker, []);
 
   const createWavBlob = (left, right, sampleRate) => {
     const numChannels = 2;
@@ -408,6 +420,7 @@ function App() {
     setProcessing(true);
     setFromCache(false);
     setProgress(0);
+    setSeparationDetail('Decoding audio…');
     setIsSeparated(false);
     resetPlayerState();
 
@@ -424,8 +437,11 @@ function App() {
       const arrayBuffer = await audioFile.arrayBuffer();
       setProgress(0.2);
 
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      // Decode at the model's 44.1 kHz rather than the device rate (often 48 kHz):
+      // the model sees the music at its real pitch, and there's ~8% less to process.
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      audioContext.close();
       setProgress(0.3);
 
       const left = audioBuffer.numberOfChannels > 0
@@ -440,15 +456,22 @@ function App() {
       const result = await new Promise((resolve, reject) => {
         const worker = initializeWorker();
         const SEGMENT_TIMEOUT = 600000;
-        let timeoutId = setTimeout(() => {
+        const onTimeout = () => {
+          discardWorker();
           reject(new Error('Separation timeout: no progress for 10 minutes'));
-        }, SEGMENT_TIMEOUT);
+        };
+        let timeoutId = setTimeout(onTimeout, SEGMENT_TIMEOUT);
 
         const resetTimeout = () => {
           clearTimeout(timeoutId);
-          timeoutId = setTimeout(() => {
-            reject(new Error('Separation timeout: no progress for 10 minutes'));
-          }, SEGMENT_TIMEOUT);
+          timeoutId = setTimeout(onTimeout, SEGMENT_TIMEOUT);
+        };
+
+        // time-left estimate from the average chunk so far
+        let runStart = performance.now();
+        const formatLeft = (ms) => {
+          const s = Math.max(1, Math.round(ms / 1000));
+          return s < 60 ? `${s} s` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
         };
 
         const handleMessage = (event) => {
@@ -465,9 +488,26 @@ function App() {
             reject(new Error(error));
           } else if (type === 'segmentProgress') {
             resetTimeout();
+            const { currentSegment, totalSegments } = event.data;
             setProgress(0.5 + event.data.progress * 0.4);
-          } else if (type === 'status' || type === 'downloadProgress') {
+            const msLeft = ((performance.now() - runStart) / currentSegment) * (totalSegments - currentSegment);
+            setSeparationDetail(currentSegment < totalSegments
+              ? `Chunk ${currentSegment} of ${totalSegments} done · about ${formatLeft(msLeft)} left`
+              : 'Finishing…');
+          } else if (type === 'downloadProgress') {
             resetTimeout();
+            const frac = event.data.loaded / event.data.total;
+            setProgress(0.3 + frac * 0.2);
+            setSeparationDetail(`Downloading model ${Math.round(frac * 100)}% · one-time, ${Math.round(event.data.total / 1e6)} MB`);
+          } else if (type === 'status') {
+            resetTimeout();
+            const message = event.data.message || '';
+            if (/^Running/.test(message)) {
+              runStart = performance.now();
+              setSeparationDetail('Separating the first chunk…');
+            } else if (/^(Loading|Downloading)/.test(message)) {
+              setSeparationDetail(message);
+            }
           }
         };
 
@@ -475,6 +515,7 @@ function App() {
           clearTimeout(timeoutId);
           worker.removeEventListener('message', handleMessage);
           worker.removeEventListener('error', handleError);
+          discardWorker(); // a crashed worker can't be reused
           reject(new Error(`Worker error: ${error.message || error}`));
         };
 
@@ -1329,7 +1370,9 @@ function App() {
                     </div>
                   </div>
                 ))}
-                <p className="hint" style={{ textAlign: 'center' }}>First run downloads ~172 MB model.</p>
+                <p className="hint" style={{ textAlign: 'center' }}>
+                  {separationDetail || 'The first separation downloads a 180 MB model once.'}
+                </p>
               </div>
             )}
             {isSeparated && !processing && (

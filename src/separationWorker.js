@@ -12,9 +12,53 @@ const numThreads = self.navigator?.hardwareConcurrency ?? 4;
 ort.env.wasm.wasmPaths = { wasm: wasmUrl, mjs: mjsUrl };
 ort.env.wasm.numThreads = numThreads;
 ort.env.wasm.simd = true;
-if (ort.env.webgpu) ort.env.webgpu.powerPreference = 'high-performance';
-
 let session = null;
+
+// Hugging Face serves the model through a fresh signed URL with `no-store`, so
+// the browser's HTTP cache never keeps it and every separation re-downloaded
+// all 180 MB. Keep our own copy in Cache Storage, keyed by the stable URL.
+const MODEL_URL = CONSTANTS.DEFAULT_MODEL_URL;
+const MODEL_CACHE = 'kappa-models-v1';
+
+async function getModelBuffer() {
+  let cache = null;
+  try {
+    cache = await caches.open(MODEL_CACHE);
+    const hit = await cache.match(MODEL_URL);
+    if (hit) {
+      self.postMessage({ type: 'status', message: 'Loading model…' });
+      return await hit.arrayBuffer();
+    }
+  } catch {
+    cache = null; // storage unavailable (private mode etc.) — just download
+  }
+
+  self.postMessage({ type: 'status', message: 'Downloading model…' });
+  const response = await fetch(MODEL_URL);
+  if (!response.ok) throw new Error(`Model download failed (HTTP ${response.status})`);
+  const total = Number(response.headers.get('Content-Length')) || 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    if (total) self.postMessage({ type: 'downloadProgress', loaded, total });
+  }
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
+
+  if (cache) {
+    try {
+      await cache.put(MODEL_URL, new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } }));
+    } catch { /* over quota — still works, just downloads again next time */ }
+  }
+  self.postMessage({ type: 'status', message: 'Loading model…' });
+  return bytes.buffer;
+}
 
 const loadSession = async () => {
   if (session) return session;
@@ -22,7 +66,9 @@ const loadSession = async () => {
   const proc = new DemucsProcessor({
     ort,
     sessionOptions: {
-      executionProviders: ['webgpu', 'wasm'],
+      // CPU only: this build has no WebGPU backend, and switching to the WebGPU
+      // build measured slower (20 s vs 14 s per segment) on integrated graphics.
+      executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
       executionMode: 'parallel',
       interOpNumThreads: numThreads,
@@ -36,7 +82,7 @@ const loadSession = async () => {
     },
   });
 
-  await proc.loadModel(CONSTANTS.DEFAULT_MODEL_URL);
+  await proc.loadModel(await getModelBuffer());
   session = proc.session;
   return session;
 };

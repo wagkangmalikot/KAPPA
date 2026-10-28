@@ -8,6 +8,10 @@ export default defineConfig({
   },
   optimizeDeps: {
     exclude: ['onnxruntime-web'],
+    // Only imported inside workers, which Vite's dependency scan doesn't crawl.
+    // Without this, the first Separate Stems / Detect Lyrics in a dev session
+    // makes Vite optimize them on the fly and force a full page reload.
+    include: ['demucs-web', '@huggingface/transformers'],
   },
   plugins: [
     react(),
